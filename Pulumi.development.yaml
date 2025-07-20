@@ -1,0 +1,12 @@
+config:
+  aws:region: eu-central-1
+  foundry:domain: foundry.yourdomain.com
+  foundry-hosting:domainName: ungrateful-foundry.link
+  foundry-hosting:route53HostedZoneId: Z091987438S9PN77PHB7O
+  discord:token:
+    secure: v1:BGSNZVz1JIojME1s:GjZujvLW9SXiFRkgOPiMmIdR6gice1RjzHomNLFxrOnhN1dAVTK/qlVM9bNYyEIS0X/EgmpDRAAul95JF4Ob5lowaQQ9J9w1dheeKPDSYZuZ5+PrJ2xEkw==
+  discord:clientId: "1396423501841170462"
+  discord:guildId: "366639774456610817"
+  discord:categoryId: "1396428839848120410"
+secretsprovider: awskms://alias/pulumi-secret-encryption-key
+encryptedkey: AQICAHh2SAT2NDa31QSPqThd4LxIWt9n4Jf5BPewks2LhS1hGwG0KCdir8QSvaycz8SNq2uZAAAAfjB8BgkqhkiG9w0BBwagbzBtAgEAMGgGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMyBa9Pq8AvU1/RW5QAgEQgDsAR6JfxPuFsJYn+jmuj7U5VZVRRRq6og/VRf/yK9sqQugKS4S4GzkjAdNUU/Folsa5J6/bwlf2GkO9Fg==

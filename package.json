@@ -1,0 +1,21 @@
+{
+    "name": "foundry-hosting",
+    "main": "index.ts",
+    "devDependencies": {
+        "@types/node": "^18",
+        "typescript": "^5.0.0"
+    },
+    "dependencies": {
+        "@aws-sdk/client-dynamodb": "^3.848.0",
+        "@aws-sdk/client-efs": "^3.848.0",
+        "@aws-sdk/client-elastic-load-balancing-v2": "^3.848.0",
+        "@aws-sdk/client-route-53": "^3.848.0",
+        "@aws-sdk/client-secrets-manager": "^3.848.0",
+        "@aws-sdk/lib-dynamodb": "^3.848.0",
+        "@pulumi/aws": "^6.0.0",
+        "@pulumi/awsx": "^2.0.2",
+        "@pulumi/pulumi": "^3.113.0",
+        "client-elastic-load-balancing-v2": "aws-sdk/client-elastic-load-balancing-v2"
+    },
+    "packageManager": "yarn@1.22.22+sha1.ac34549e6aa8e7ead463a7407e1c7390f61a6610"
+}
