@@ -418,7 +418,96 @@ const instanceTable = new aws.dynamodb.Table(`${projectName}-instances`, {
   },
 });
 
-// Schedule tracking table
+// License pool table
+const licensePoolTable = new aws.dynamodb.Table(`${projectName}-license-pool`, {
+  name: `${projectName}-instances-license-pool`,
+  billingMode: "PAY_PER_REQUEST",
+  hashKey: "licenseId",
+  attributes: [
+    { name: "licenseId", type: "S" },
+    { name: "ownerId", type: "S" },
+  ],
+  globalSecondaryIndexes: [
+    {
+      name: "ownerId-index",
+      hashKey: "ownerId",
+      projectionType: "ALL",
+    },
+  ],
+  serverSideEncryption: {
+    enabled: true,
+  },
+  tags: {
+    Name: `${projectName}-license-pool`,
+    Environment: environment,
+  },
+});
+
+// Scheduled sessions table
+const scheduledSessionsTable = new aws.dynamodb.Table(
+  `${projectName}-scheduled-sessions`,
+  {
+    name: `${projectName}-instances-scheduled-sessions`,
+    billingMode: "PAY_PER_REQUEST",
+    hashKey: "sessionId",
+    attributes: [
+      { name: "sessionId", type: "S" },
+      { name: "userId", type: "S" },
+      { name: "startTime", type: "N" },
+    ],
+    globalSecondaryIndexes: [
+      {
+        name: "userId-index",
+        hashKey: "userId",
+        projectionType: "ALL",
+      },
+      {
+        name: "startTime-index",
+        hashKey: "startTime",
+        projectionType: "ALL",
+      },
+    ],
+    serverSideEncryption: {
+      enabled: true,
+    },
+    tags: {
+      Name: `${projectName}-scheduled-sessions`,
+      Environment: environment,
+    },
+  }
+);
+
+// License reservations table
+const licenseReservationsTable = new aws.dynamodb.Table(
+  `${projectName}-license-reservations`,
+  {
+    name: `${projectName}-instances-license-reservations`,
+    billingMode: "PAY_PER_REQUEST",
+    hashKey: "reservationId",
+    attributes: [
+      { name: "reservationId", type: "S" },
+      { name: "licenseId", type: "S" },
+      { name: "startTime", type: "N" },
+    ],
+    globalSecondaryIndexes: [
+      {
+        name: "licenseId-startTime-index",
+        hashKey: "licenseId",
+        rangeKey: "startTime",
+        projectionType: "ALL",
+      },
+    ],
+    serverSideEncryption: {
+      enabled: true,
+    },
+    tags: {
+      Name: `${projectName}-license-reservations`,
+      Environment: environment,
+    },
+  }
+);
+
+// Legacy schedule tracking table (keeping for backward compatibility)
 const scheduleTable = new aws.dynamodb.Table(`${projectName}-schedules`, {
   name: `${projectName}-schedules`,
   billingMode: "PAY_PER_REQUEST",
@@ -574,6 +663,9 @@ const instanceManagementLambda = new aws.lambda.Function(
         CLUSTER_NAME: cluster.name,
         INSTANCE_TABLE_NAME: instanceTable.name,
         SCHEDULE_TABLE_NAME: scheduleTable.name,
+        LICENSE_POOL_TABLE_NAME: licensePoolTable.name,
+        SCHEDULED_SESSIONS_TABLE_NAME: scheduledSessionsTable.name,
+        LICENSE_RESERVATIONS_TABLE_NAME: licenseReservationsTable.name,
         FILE_SYSTEM_ID: fileSystem.id,
         VPC_ID: vpc.vpcId,
         PRIVATE_SUBNET_IDS: vpc.privateSubnetIds.apply((ids) => ids.join(",")),
@@ -891,6 +983,86 @@ export const discordBotOutputs = {
 };
 
 // =================
+// EVENTBRIDGE SCHEDULED RULES FOR AUTO-SHUTDOWN
+// =================
+
+// EventBridge rule for auto-shutdown check (every 5 minutes)
+const autoShutdownRule = new aws.cloudwatch.EventRule(
+  `${projectName}-auto-shutdown-rule`,
+  {
+    description: "Trigger auto-shutdown check every 5 minutes",
+    scheduleExpression: "rate(5 minutes)",
+    tags: {
+      Name: `${projectName}-auto-shutdown-rule`,
+      Environment: environment,
+    },
+  }
+);
+
+// Permission for EventBridge to invoke Lambda
+const autoShutdownLambdaPermission = new aws.lambda.Permission(
+  `${projectName}-auto-shutdown-lambda-permission`,
+  {
+    statementId: "AllowExecutionFromCloudWatch",
+    action: "lambda:InvokeFunction",
+    function: instanceManagementLambda.name,
+    principal: "events.amazonaws.com",
+    sourceArn: autoShutdownRule.arn,
+  }
+);
+
+// EventBridge target for auto-shutdown
+const autoShutdownTarget = new aws.cloudwatch.EventTarget(
+  `${projectName}-auto-shutdown-target`,
+  {
+    rule: autoShutdownRule.name,
+    arn: instanceManagementLambda.arn,
+    input: JSON.stringify({
+      action: "auto-shutdown-check",
+      userId: "system",
+    }),
+  }
+);
+
+// EventBridge rule for session preparation (every minute)
+const sessionPrepRule = new aws.cloudwatch.EventRule(
+  `${projectName}-session-prep-rule`,
+  {
+    description: "Prepare upcoming scheduled sessions every minute",
+    scheduleExpression: "rate(1 minute)",
+    tags: {
+      Name: `${projectName}-session-prep-rule`,
+      Environment: environment,
+    },
+  }
+);
+
+// Permission for session prep EventBridge to invoke Lambda
+const sessionPrepLambdaPermission = new aws.lambda.Permission(
+  `${projectName}-session-prep-lambda-permission`,
+  {
+    statementId: "AllowSessionPrepFromCloudWatch",
+    action: "lambda:InvokeFunction",
+    function: instanceManagementLambda.name,
+    principal: "events.amazonaws.com",
+    sourceArn: sessionPrepRule.arn,
+  }
+);
+
+// EventBridge target for session preparation
+const sessionPrepTarget = new aws.cloudwatch.EventTarget(
+  `${projectName}-session-prep-target`,
+  {
+    rule: sessionPrepRule.name,
+    arn: instanceManagementLambda.arn,
+    input: JSON.stringify({
+      action: "prepare-sessions",
+      userId: "system",
+    }),
+  }
+);
+
+// =================
 // EXPORTS
 // =================
 export const clusterName = cluster.name;
@@ -898,6 +1070,9 @@ export const loadBalancerDns = loadBalancer.dnsName;
 export const fileSystemId = fileSystem.id;
 export const instanceTableName = instanceTable.name;
 export const scheduleTableName = scheduleTable.name;
+export const licensePoolTableName = licensePoolTable.name;
+export const scheduledSessionsTableName = scheduledSessionsTable.name;
+export const licenseReservationsTableName = licenseReservationsTable.name;
 export const lambdaFunctionName = instanceManagementLambda.name;
 export const vpcId = vpc.vpcId;
 export const privateSubnetIds = vpc.privateSubnetIds;
@@ -923,6 +1098,9 @@ export const outputs = {
     fileSystemId: fileSystemId,
     instanceTable: instanceTableName,
     scheduleTable: scheduleTableName,
+    licensePoolTable: licensePoolTableName,
+    scheduledSessionsTable: scheduledSessionsTableName,
+    licenseReservationsTable: licenseReservationsTableName,
   },
   lambda: {
     functionName: lambdaFunctionName,

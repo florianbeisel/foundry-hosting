@@ -39,7 +39,7 @@ A comprehensive AWS-based hosting solution for Foundry Virtual Tabletop with Dis
 
 ## 🏗️ Architecture
 
-```
+```text
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │   Discord Bot   │    │   Lambda API     │    │   ECS Fargate   │
 │   (ECS Task)    ├────┤   (Instance Mgmt)├────┤  (Foundry VTT)  │
@@ -151,6 +151,7 @@ This is passed to the Foundry Docker container via `FOUNDRY_AWS_CONFIG` environm
    ```
 
 3. **Deploy Discord Bot**:
+
    ```bash
    cd discord
    npm run deploy

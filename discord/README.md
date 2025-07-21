@@ -2,7 +2,7 @@
 
 ## 1. Create Discord Application
 
-1. Go to https://discord.com/developers/applications
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
 2. Click "New Application"
 3. Name it "Foundry VTT Manager"
 4. Go to "Bot" tab and click "Add Bot"

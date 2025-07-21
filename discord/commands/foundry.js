@@ -75,6 +75,15 @@ async function handleDashboard(interaction, userId) {
       unknown: "❔",
     };
 
+    // Determine license display text
+    const licenseType = result.licenseType || "byol";
+    const licenseDisplay =
+      licenseType === "byol"
+        ? `🔑 BYOL (Own License)${
+            result.allowLicenseSharing ? " - Shared" : ""
+          }`
+        : "🌐 Pooled (Shared License)";
+
     const embed = new EmbedBuilder()
       .setColor(result.status === "running" ? "#00ff00" : "#888888")
       .setTitle("🎲 Your Foundry VTT Dashboard")
@@ -88,11 +97,45 @@ async function handleDashboard(interaction, userId) {
           value: `<t:${result.updatedAt}:R>`,
           inline: true,
         },
+        {
+          name: "License Type",
+          value: licenseDisplay,
+          inline: true,
+        },
       ])
       .setTimestamp();
 
     if (result.url && result.status === "running") {
       embed.addFields([{ name: "Access URL", value: result.url }]);
+
+      // Add auto-shutdown information if available
+      if (result.autoShutdownAt) {
+        const shutdownTime = new Date(result.autoShutdownAt * 1000);
+        const now = new Date();
+        const timeLeft = Math.max(
+          0,
+          Math.floor((shutdownTime - now) / (1000 * 60))
+        ); // minutes
+
+        let shutdownText;
+        if (timeLeft > 60) {
+          shutdownText = `<t:${result.autoShutdownAt}:R> (${Math.floor(
+            timeLeft / 60
+          )}h ${timeLeft % 60}m left)`;
+        } else if (timeLeft > 0) {
+          shutdownText = `<t:${result.autoShutdownAt}:R> (${timeLeft}m left)`;
+        } else {
+          shutdownText = "⚠️ Overdue for shutdown";
+        }
+
+        embed.addFields([
+          {
+            name: "🕒 Auto-Shutdown",
+            value: shutdownText,
+            inline: true,
+          },
+        ]);
+      }
     }
 
     if (result.foundryVersion) {
@@ -105,9 +148,38 @@ async function handleDashboard(interaction, userId) {
       ]);
     }
 
+    // Show next scheduled session if available
+    if (result.nextScheduledSession) {
+      const session = result.nextScheduledSession;
+      embed.addFields([
+        {
+          name: "📅 Next Scheduled Session",
+          value: `**${session.title || "Gaming Session"}**\nStarts <t:${
+            session.startTime
+          }:R> (<t:${session.startTime}:f>)`,
+          inline: false,
+        },
+      ]);
+    }
+
+    // Show currently linked session if instance is running a scheduled session
+    if (result.linkedSessionId && result.status === "running") {
+      embed.addFields([
+        {
+          name: "🎮 Active Session",
+          value: `Running scheduled session\nAuto-ends <t:${result.autoShutdownAt}:R>`,
+          inline: true,
+        },
+      ]);
+    }
+
     const actionRow = new ActionRowBuilder();
 
-    if (result.status === "stopped" || result.status === "created") {
+    // Different buttons based on license type and status
+    if (
+      licenseType === "byol" &&
+      (result.status === "stopped" || result.status === "created")
+    ) {
       actionRow.addComponents(
         new ButtonBuilder()
           .setCustomId(`foundry_start_${userId}`)
@@ -127,12 +199,30 @@ async function handleDashboard(interaction, userId) {
       );
     }
 
+    // Add scheduling button for all users
     actionRow.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`foundry_schedule_${userId}`)
+        .setLabel("Schedule Session")
+        .setStyle(ButtonStyle.Primary)
+        .setEmoji("📅")
+    );
+
+    actionRow.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`foundry_sessions_${userId}`)
+        .setLabel("My Sessions")
+        .setStyle(ButtonStyle.Secondary)
+        .setEmoji("📋"),
       new ButtonBuilder()
         .setCustomId(`foundry_status_${userId}`)
         .setLabel("Refresh")
         .setStyle(ButtonStyle.Secondary)
-        .setEmoji("🔄"),
+        .setEmoji("🔄")
+    );
+
+    // Second row for less common actions
+    const secondRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId(`foundry_adminkey_${userId}`)
         .setLabel("Get Admin Key")
@@ -198,7 +288,7 @@ async function handleDashboard(interaction, userId) {
 
     await interaction.editReply({
       embeds: [embed],
-      components: [actionRow, versionSelectRow],
+      components: [actionRow, secondRow, versionSelectRow],
     });
   } catch (error) {
     if (error.message.includes("not found")) {

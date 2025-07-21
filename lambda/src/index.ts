@@ -6,12 +6,18 @@ import {
 import { ECSManager } from "./utils/ecs-manager";
 import { EFSManager } from "./utils/efs-manager";
 import { SecretsManager } from "./utils/secrets-manager";
-import { DynamoDBManager } from "./utils/dynamodb-manager";
+import {
+  DynamoDBManager,
+  ScheduledSession,
+  LicensePool,
+} from "./utils/dynamodb-manager";
 import { ALBManager } from "./utils/alb-manager";
 import { Route53Manager } from "./utils/route53-manager";
 import { TaskManager } from "./utils/task-manager";
 import { S3Manager } from "./utils/s3-manager";
 import { IAMManager } from "./utils/iam-manager";
+import { LicenseScheduler } from "./utils/license-scheduler";
+import { AutoShutdownManager } from "./utils/auto-shutdown-manager";
 
 interface FoundryEvent {
   action:
@@ -22,12 +28,45 @@ interface FoundryEvent {
     | "delete"
     | "status"
     | "list-all"
-    | "update-version";
+    | "update-version"
+    | "schedule-session"
+    | "cancel-session"
+    | "list-sessions"
+    | "set-license-sharing"
+    | "check-availability"
+    | "start-scheduled-session"
+    | "end-scheduled-session"
+    | "auto-shutdown-check"
+    | "prepare-sessions"
+    | "shutdown-stats"
+    | "admin-overview"
+    | "admin-force-shutdown"
+    | "admin-cancel-session"
+    | "admin-cancel-all-sessions"
+    | "admin-system-maintenance";
   userId: string;
   sanitizedUsername?: string;
   foundryUsername?: string;
   foundryPassword?: string;
   foundryVersion?: string;
+  // License management fields
+  licenseType?: "byol" | "pooled";
+  allowLicenseSharing?: boolean;
+  maxConcurrentUsers?: number;
+  // Scheduling fields
+  sessionId?: string;
+  startTime?: number;
+  endTime?: number;
+  sessionTitle?: string;
+  sessionDescription?: string;
+  preferredLicenseId?: string;
+  // Admin fields
+  targetUserId?: string;
+  forceReason?: string;
+  // Pooled license field
+  selectedLicenseId?: string;
+  // Destroy options
+  keepLicenseSharing?: boolean;
 }
 
 const ecsManager = new ECSManager(process.env.CLUSTER_NAME!);
@@ -45,6 +84,17 @@ const route53Manager = new Route53Manager(
 const taskManager = new TaskManager(process.env.CLUSTER_NAME!);
 const s3Manager = new S3Manager();
 const iamManager = new IAMManager();
+const licenseScheduler = new LicenseScheduler(
+  dynamoManager,
+  ecsManager,
+  secretsManager
+);
+const autoShutdownManager = new AutoShutdownManager(
+  dynamoManager,
+  ecsManager,
+  albManager,
+  licenseScheduler
+);
 
 export const handler = async (
   event: FoundryEvent,
@@ -71,7 +121,7 @@ export const handler = async (
         result = await stopInstance(userId);
         break;
       case "destroy":
-        result = await destroyInstance(userId);
+        result = await destroyInstance(userId, event);
         break;
       case "delete":
         result = await deleteUser(userId);
@@ -84,6 +134,54 @@ export const handler = async (
         break;
       case "update-version":
         result = await updateInstanceVersion(userId, event.foundryVersion!);
+        break;
+      case "schedule-session":
+        result = await scheduleSession(userId, event);
+        break;
+      case "cancel-session":
+        result = await cancelSession(event.sessionId!);
+        break;
+      case "list-sessions":
+        result = await listUserSessions(userId);
+        break;
+      case "set-license-sharing":
+        result = await setLicenseSharing(userId, event);
+        break;
+      case "check-availability":
+        result = await checkLicenseAvailability(event);
+        break;
+      case "start-scheduled-session":
+        result = await startScheduledSession(event.sessionId!);
+        break;
+      case "end-scheduled-session":
+        result = await endScheduledSession(event.sessionId!);
+        break;
+      case "auto-shutdown-check":
+        result = await performAutoShutdownCheck();
+        break;
+      case "prepare-sessions":
+        result = await prepareUpcomingSessions();
+        break;
+      case "shutdown-stats":
+        result = await getShutdownStats();
+        break;
+      case "admin-overview":
+        result = await getAdminOverview();
+        break;
+      case "admin-force-shutdown":
+        result = await adminForceShutdown(
+          event.targetUserId!,
+          event.forceReason
+        );
+        break;
+      case "admin-cancel-session":
+        result = await adminCancelSession(event.sessionId!, event.forceReason);
+        break;
+      case "admin-cancel-all-sessions":
+        result = await adminCancelAllSessions(event.forceReason);
+        break;
+      case "admin-system-maintenance":
+        result = await adminSystemMaintenance(event.forceReason);
         break;
       default:
         return errorResponse(400, `Unknown action: ${action}`);
@@ -105,9 +203,107 @@ async function createInstance(userId: string, event: FoundryEvent) {
     throw new Error("User already has an instance");
   }
 
-  const { foundryUsername, foundryPassword, sanitizedUsername } = event;
-  if (!foundryUsername || !foundryPassword) {
-    throw new Error("Missing Foundry credentials");
+  const {
+    foundryUsername,
+    foundryPassword,
+    sanitizedUsername,
+    licenseType,
+    allowLicenseSharing,
+    maxConcurrentUsers,
+    selectedLicenseId,
+  } = event;
+
+  let actualFoundryUsername: string;
+  let actualFoundryPassword: string;
+
+  // Validate license type
+  const validatedLicenseType = licenseType || "byol";
+  if (!["byol", "pooled"].includes(validatedLicenseType)) {
+    throw new Error("Invalid license type. Must be 'byol' or 'pooled'");
+  }
+
+  if (validatedLicenseType === "pooled") {
+    // For pooled licenses, we handle two cases:
+    // 1. selectedLicenseId provided (specific license chosen)
+    // 2. No selectedLicenseId (automatic assignment at runtime)
+
+    if (selectedLicenseId) {
+      // Case 1: Specific license selected (e.g. user's own license in pooled mode)
+      // Extract owner ID from license ID (format: "byol-{ownerId}")
+      const ownerIdMatch = selectedLicenseId.match(/^byol-(.+)$/);
+      if (!ownerIdMatch) {
+        throw new Error("Invalid license ID format");
+      }
+
+      const ownerId = ownerIdMatch[1];
+
+      // Get the license owner's credentials
+      try {
+        const ownerCredentials = await secretsManager.getCredentials(ownerId);
+        if (!ownerCredentials) {
+          throw new Error(
+            "License owner credentials not found - the license owner may have deleted their instance"
+          );
+        }
+
+        actualFoundryUsername = ownerCredentials.username;
+        actualFoundryPassword = ownerCredentials.password;
+      } catch (error) {
+        // If credentials not found, also check if we should deactivate the license pool
+        const licensePool = await dynamoManager.getLicensePool(
+          selectedLicenseId
+        );
+        if (licensePool && licensePool.isActive) {
+          try {
+            await dynamoManager.updateLicensePool(selectedLicenseId, {
+              isActive: false,
+              updatedAt: Math.floor(Date.now() / 1000),
+            });
+            console.log(
+              `Auto-deactivated license pool with missing credentials: ${selectedLicenseId}`
+            );
+          } catch (poolError) {
+            console.error(`Failed to auto-deactivate license pool:`, poolError);
+          }
+        }
+
+        throw new Error(
+          `Failed to get license owner credentials: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }. The license pool has been automatically deactivated.`
+        );
+      }
+    } else {
+      // Case 2: No specific license - will be assigned at start/schedule time
+      // For now, we don't store any credentials. They'll be obtained when starting instance.
+      actualFoundryUsername = "POOLED_DYNAMIC"; // Placeholder
+      actualFoundryPassword = "POOLED_DYNAMIC"; // Placeholder
+      console.log(
+        `Creating pooled instance with dynamic license assignment for user: ${userId}`
+      );
+    }
+  } else {
+    // For BYOL, use provided credentials or reuse existing ones
+    if (!foundryUsername || !foundryPassword) {
+      // Try to reuse existing credentials for re-registration
+      try {
+        const existingCredentials = await secretsManager.getCredentials(userId);
+        if (!existingCredentials) {
+          throw new Error("Missing Foundry credentials for BYOL license");
+        }
+
+        actualFoundryUsername = existingCredentials.username;
+        actualFoundryPassword = existingCredentials.password;
+        console.log(
+          `Reusing existing credentials for BYOL re-registration: ${userId}`
+        );
+      } catch (error) {
+        throw new Error("Missing Foundry credentials for BYOL license");
+      }
+    } else {
+      actualFoundryUsername = foundryUsername;
+      actualFoundryPassword = foundryPassword;
+    }
   }
 
   if (!sanitizedUsername) {
@@ -144,8 +340,8 @@ async function createInstance(userId: string, event: FoundryEvent) {
   // Store credentials in Secrets Manager
   secretArn = await secretsManager.storeCredentials(
     userId,
-    foundryUsername,
-    foundryPassword,
+    actualFoundryUsername,
+    actualFoundryPassword,
     adminKey
   );
 
@@ -186,9 +382,45 @@ async function createInstance(userId: string, event: FoundryEvent) {
     s3SecretAccessKey: s3Credentials.secretAccessKey,
     targetGroupArn,
     albRulePriority: priority,
+    licenseType: validatedLicenseType,
+    allowLicenseSharing: allowLicenseSharing,
+    maxConcurrentUsers: maxConcurrentUsers || 1,
+    licenseOwnerId:
+      validatedLicenseType === "pooled" ? selectedLicenseId : undefined,
     createdAt: Math.floor(Date.now() / 1000),
     updatedAt: Math.floor(Date.now() / 1000),
   });
+
+  // If user is sharing their license, add to license pool or reactivate existing one
+  if (validatedLicenseType === "byol" && allowLicenseSharing) {
+    const licenseId = `byol-${userId}`;
+
+    // Check if there's already a license pool (might be deactivated)
+    const existingPool = await dynamoManager.getLicensePool(licenseId);
+
+    if (existingPool) {
+      // Reactivate existing pool with updated settings
+      await dynamoManager.updateLicensePool(licenseId, {
+        ownerUsername: sanitizedUsername, // Update in case username changed
+        maxConcurrentUsers: maxConcurrentUsers || 1,
+        isActive: true,
+        updatedAt: Math.floor(Date.now() / 1000),
+      });
+      console.log(`Reactivated existing license pool: ${licenseId}`);
+    } else {
+      // Create new license pool
+      await dynamoManager.createLicensePool({
+        licenseId,
+        ownerId: userId,
+        ownerUsername: sanitizedUsername,
+        maxConcurrentUsers: maxConcurrentUsers || 1,
+        isActive: true,
+        createdAt: Math.floor(Date.now() / 1000),
+        updatedAt: Math.floor(Date.now() / 1000),
+      });
+      console.log(`Created new license pool: ${licenseId}`);
+    }
+  }
 
   // Create DNS record pointing to ALB
   await route53Manager.createUserDNSRecord(
@@ -218,6 +450,21 @@ async function startInstance(userId: string) {
 
   if (instance.status === "running") {
     throw new Error("Instance is already running");
+  }
+
+  // For BYOL users, check if starting on-demand would conflict with scheduled sessions
+  if (instance.licenseType === "byol") {
+    const canStart = await licenseScheduler.canStartOnDemandInstance(userId);
+    if (!canStart.canStart) {
+      throw new Error(
+        canStart.reason ||
+          "Cannot start on-demand instance due to scheduling conflicts"
+      );
+    }
+  } else if (instance.licenseType === "pooled") {
+    throw new Error(
+      "Pooled license users must schedule sessions - use 'Schedule Session' instead of on-demand start"
+    );
   }
 
   // Register task definition and start task
@@ -257,6 +504,16 @@ async function startInstance(userId: string) {
     instance.albRulePriority!
   );
 
+  const now = Math.floor(Date.now() / 1000);
+
+  // Calculate auto-shutdown time
+  const licenseType = instance.licenseType || "byol";
+  const autoShutdownAt = autoShutdownManager.calculateAutoShutdownTime(
+    now,
+    licenseType,
+    instance.linkedSessionId
+  );
+
   // Update instance status
   await dynamoManager.updateInstance(userId, {
     status: "running",
@@ -264,7 +521,9 @@ async function startInstance(userId: string) {
     taskDefinitionArn,
     taskPrivateIp,
     albRuleArn: ruleArn,
-    updatedAt: Math.floor(Date.now() / 1000),
+    startedAt: now,
+    autoShutdownAt,
+    updatedAt: now,
   });
 
   return {
@@ -305,6 +564,9 @@ async function stopInstance(userId: string) {
     taskArn: undefined,
     taskPrivateIp: undefined,
     albRuleArn: undefined,
+    autoShutdownAt: undefined,
+    startedAt: undefined,
+    linkedSessionId: undefined,
     updatedAt: Math.floor(Date.now() / 1000),
   });
 
@@ -315,7 +577,7 @@ async function stopInstance(userId: string) {
   };
 }
 
-async function destroyInstance(userId: string) {
+async function destroyInstance(userId: string, event?: FoundryEvent) {
   const instance = await dynamoManager.getInstance(userId);
   if (!instance) {
     throw new Error("Instance not found");
@@ -362,6 +624,27 @@ async function destroyInstance(userId: string) {
     await secretsManager.deleteSecret(instance.secretArn);
   }
 
+  // Conditionally deactivate license pools based on user choice
+  if (instance.allowLicenseSharing && !event?.keepLicenseSharing) {
+    const licenseId = `byol-${userId}`;
+    try {
+      await dynamoManager.updateLicensePool(licenseId, {
+        isActive: false,
+        updatedAt: Math.floor(Date.now() / 1000),
+      });
+      console.log(
+        `Deactivated license pool for destroyed instance: ${licenseId}`
+      );
+    } catch (error) {
+      console.error(`Failed to deactivate license pool ${licenseId}:`, error);
+      // Continue with instance deletion even if license pool deactivation fails
+    }
+  } else if (instance.allowLicenseSharing && event?.keepLicenseSharing) {
+    console.log(
+      `License sharing preserved for destroyed instance: byol-${userId} (user choice: keep sharing active)`
+    );
+  }
+
   // Delete instance record
   await dynamoManager.deleteInstance(userId);
 
@@ -394,6 +677,24 @@ async function deleteUser(userId: string) {
     console.log(`No existing credentials found for user: ${userId}`);
   }
 
+  // Deactivate any license pools owned by this user since credentials are being deleted
+  const licenseId = `byol-${userId}`;
+  try {
+    const existingPool = await dynamoManager.getLicensePool(licenseId);
+    if (existingPool && existingPool.isActive) {
+      await dynamoManager.updateLicensePool(licenseId, {
+        isActive: false,
+        updatedAt: Math.floor(Date.now() / 1000),
+      });
+      console.log(
+        `Deactivated orphaned license pool for deleted user: ${licenseId}`
+      );
+    }
+  } catch (error) {
+    console.error(`Failed to deactivate license pool ${licenseId}:`, error);
+    // Continue with user deletion even if license pool deactivation fails
+  }
+
   // Note: DNS cleanup is handled in destroyInstance if instance exists
   // For orphaned DNS records, we would need the sanitized username
   // which we don't have if there's no instance record
@@ -421,6 +722,24 @@ async function getInstanceStatus(userId: string) {
     }
   }
 
+  // Get upcoming scheduled sessions for this user
+  let nextScheduledSession = null;
+  try {
+    const userSessions = await dynamoManager.getUserScheduledSessions(userId);
+    const now = Math.floor(Date.now() / 1000);
+    const upcomingSessions = userSessions
+      .filter(
+        (session) => session.status === "scheduled" && session.startTime > now
+      )
+      .sort((a, b) => a.startTime - b.startTime);
+
+    if (upcomingSessions.length > 0) {
+      nextScheduledSession = upcomingSessions[0];
+    }
+  } catch (error) {
+    console.error("Error getting scheduled sessions:", error);
+  }
+
   return {
     userId,
     status: instance.status,
@@ -433,6 +752,11 @@ async function getInstanceStatus(userId: string) {
     s3BucketUrl: instance.s3BucketName
       ? s3Manager.getBucketUrl(instance.s3BucketName)
       : undefined,
+    licenseType: instance.licenseType,
+    allowLicenseSharing: instance.allowLicenseSharing,
+    autoShutdownAt: instance.autoShutdownAt,
+    linkedSessionId: instance.linkedSessionId,
+    nextScheduledSession,
   };
 }
 
@@ -511,6 +835,544 @@ async function updateInstanceVersion(userId: string, foundryVersion: string) {
     userId,
     foundryVersion,
     note: "Restart your instance to use the new version",
+  };
+}
+
+async function scheduleSession(userId: string, event: FoundryEvent) {
+  if (!event.startTime || !event.endTime || !event.licenseType) {
+    throw new Error("Missing required fields: startTime, endTime, licenseType");
+  }
+
+  const instance = await dynamoManager.getInstance(userId);
+  if (!instance) {
+    throw new Error("User must have an instance to schedule sessions");
+  }
+
+  const result = await licenseScheduler.scheduleSession({
+    userId,
+    username: instance.sanitizedUsername,
+    startTime: event.startTime,
+    endTime: event.endTime,
+    licenseType: event.licenseType,
+    title: event.sessionTitle,
+    description: event.sessionDescription,
+    preferredLicenseId: event.preferredLicenseId,
+  });
+
+  return {
+    message: result.message,
+    success: result.success,
+    sessionId: result.sessionId,
+    conflictsResolved: result.conflictsResolved,
+  };
+}
+
+async function cancelSession(sessionId: string) {
+  const session = await dynamoManager.getScheduledSession(sessionId);
+  if (!session) {
+    throw new Error("Session not found");
+  }
+
+  await dynamoManager.updateScheduledSession(sessionId, {
+    status: "cancelled",
+    updatedAt: Math.floor(Date.now() / 1000),
+  });
+
+  return {
+    message: "Session cancelled successfully",
+    sessionId,
+  };
+}
+
+async function listUserSessions(userId: string) {
+  const sessions = await dynamoManager.getUserScheduledSessions(userId);
+  return {
+    sessions,
+    count: sessions.length,
+  };
+}
+
+async function setLicenseSharing(userId: string, event: FoundryEvent) {
+  const instance = await dynamoManager.getInstance(userId);
+  if (!instance) {
+    throw new Error("Instance not found");
+  }
+
+  // Default to BYOL if not specified
+  const licenseType = event.licenseType || "byol";
+
+  await dynamoManager.updateInstance(userId, {
+    licenseType,
+    allowLicenseSharing: event.allowLicenseSharing,
+    maxConcurrentUsers: event.maxConcurrentUsers,
+    updatedAt: Math.floor(Date.now() / 1000),
+  });
+
+  // If user is sharing their license, add to license pool or reactivate existing one
+  if (licenseType === "byol" && event.allowLicenseSharing) {
+    const licenseId = `byol-${userId}`;
+
+    // Check if there's already a license pool (might be deactivated)
+    const existingPool = await dynamoManager.getLicensePool(licenseId);
+
+    if (existingPool) {
+      // Reactivate or update existing pool
+      await dynamoManager.updateLicensePool(licenseId, {
+        ownerUsername: instance.sanitizedUsername,
+        maxConcurrentUsers: event.maxConcurrentUsers || 1,
+        isActive: true,
+        updatedAt: Math.floor(Date.now() / 1000),
+      });
+      console.log(`Reactivated existing license pool: ${licenseId}`);
+    } else {
+      // Create new license pool
+      await dynamoManager.createLicensePool({
+        licenseId,
+        ownerId: userId,
+        ownerUsername: instance.sanitizedUsername,
+        maxConcurrentUsers: event.maxConcurrentUsers || 1,
+        isActive: true,
+        createdAt: Math.floor(Date.now() / 1000),
+        updatedAt: Math.floor(Date.now() / 1000),
+      });
+      console.log(`Created new license pool: ${licenseId}`);
+    }
+  } else if (licenseType === "byol" && !event.allowLicenseSharing) {
+    // If user is turning off license sharing, deactivate their pool
+    const licenseId = `byol-${userId}`;
+    try {
+      const existingPool = await dynamoManager.getLicensePool(licenseId);
+      if (existingPool && existingPool.isActive) {
+        await dynamoManager.updateLicensePool(licenseId, {
+          isActive: false,
+          updatedAt: Math.floor(Date.now() / 1000),
+        });
+        console.log(`Deactivated license pool: ${licenseId}`);
+      }
+    } catch (error) {
+      console.error(`Failed to deactivate license pool ${licenseId}:`, error);
+    }
+  }
+
+  return {
+    message: "License sharing settings updated",
+    licenseType,
+    allowLicenseSharing: event.allowLicenseSharing,
+    maxConcurrentUsers: event.maxConcurrentUsers,
+  };
+}
+
+async function checkLicenseAvailability(event: FoundryEvent) {
+  if (!event.startTime || !event.endTime || !event.licenseType) {
+    throw new Error("Missing required fields: startTime, endTime, licenseType");
+  }
+
+  const availability = await licenseScheduler.checkLicenseAvailability(
+    event.licenseType,
+    event.startTime,
+    event.endTime,
+    event.preferredLicenseId
+  );
+
+  return {
+    available: availability.available,
+    conflictingInstances: availability.conflictingInstances,
+    conflictingSessions: availability.conflictingSessions,
+    availableLicenses: availability.availableLicenses,
+  };
+}
+
+async function startScheduledSession(sessionId: string) {
+  const result = await licenseScheduler.startScheduledSession(sessionId);
+  return result;
+}
+
+async function endScheduledSession(sessionId: string) {
+  const result = await licenseScheduler.endScheduledSession(sessionId);
+  return result;
+}
+
+async function performAutoShutdownCheck() {
+  const result = await autoShutdownManager.checkAndShutdownExpiredInstances();
+  return {
+    message: `Auto-shutdown check completed. ${result.shutdownCount} instances shut down.`,
+    shutdownCount: result.shutdownCount,
+    results: result.results,
+  };
+}
+
+async function prepareUpcomingSessions() {
+  const result = await autoShutdownManager.prepareForUpcomingSessions();
+  return {
+    message: `Prepared ${result.sessionsStarted} sessions, resolved ${result.conflictsResolved} conflicts`,
+    sessionsStarted: result.sessionsStarted,
+    conflictsResolved: result.conflictsResolved,
+  };
+}
+
+async function getShutdownStats() {
+  const stats = await autoShutdownManager.getAutoShutdownStats();
+  return {
+    message: "Auto-shutdown statistics",
+    stats,
+  };
+}
+
+async function getAdminOverview() {
+  const now = Math.floor(Date.now() / 1000);
+
+  // Get all instances
+  const allInstances = await dynamoManager.getAllInstances();
+
+  // Get all sessions in a wide time range to find active ones
+  const allRecentSessions = await dynamoManager.getSessionsInTimeRange(
+    now - 24 * 60 * 60, // Last 24 hours
+    now + 24 * 60 * 60 // Next 24 hours
+  );
+
+  // Filter active sessions
+  const activeSessions = allRecentSessions.filter((s) => s.status === "active");
+
+  // Get upcoming sessions (next 24 hours)
+  const upcomingSessions = allRecentSessions.filter(
+    (s) => s.status === "scheduled" && s.startTime > now
+  );
+
+  // Get license pools
+  const licensePools = await dynamoManager.getAllActiveLicenses();
+
+  // Get auto-shutdown stats
+  const shutdownStats = await autoShutdownManager.getAutoShutdownStats();
+
+  // Calculate summary statistics
+  const runningInstances = allInstances.filter((i) => i.status === "running");
+  const byolInstances = allInstances.filter((i) => i.licenseType === "byol");
+  const pooledInstances = allInstances.filter(
+    (i) => i.licenseType === "pooled"
+  );
+  const sharedLicenses = allInstances.filter((i) => i.allowLicenseSharing);
+
+  // Get instances with auto-shutdown timers
+  const instancesWithTimers = runningInstances.filter((i) => i.autoShutdownAt);
+
+  // Recent activity (last 2 hours)
+  const recentThreshold = now - 2 * 60 * 60;
+  const recentlyStarted = allInstances.filter(
+    (i) => i.startedAt && i.startedAt > recentThreshold
+  );
+  const recentlyUpdated = allInstances.filter(
+    (i) => i.updatedAt > recentThreshold
+  );
+
+  return {
+    timestamp: now,
+    summary: {
+      totalInstances: allInstances.length,
+      runningInstances: runningInstances.length,
+      byolInstances: byolInstances.length,
+      pooledInstances: pooledInstances.length,
+      sharedLicenses: sharedLicenses.length,
+      activeSessions: activeSessions.length,
+      upcomingSessions: upcomingSessions.length,
+      instancesWithTimers: instancesWithTimers.length,
+    },
+    instances: {
+      running: runningInstances.map((i) => ({
+        userId: i.userId,
+        username: i.sanitizedUsername,
+        status: i.status,
+        licenseType: i.licenseType,
+        startedAt: i.startedAt,
+        autoShutdownAt: i.autoShutdownAt,
+        linkedSessionId: i.linkedSessionId,
+        foundryVersion: i.foundryVersion,
+      })),
+      stopped: allInstances
+        .filter((i) => i.status === "stopped")
+        .map((i) => ({
+          userId: i.userId,
+          username: i.sanitizedUsername,
+          licenseType: i.licenseType,
+          updatedAt: i.updatedAt,
+        })),
+    },
+    sessions: {
+      active: activeSessions.map((s) => ({
+        sessionId: s.sessionId,
+        userId: s.userId,
+        username: s.username,
+        title: s.title,
+        startTime: s.startTime,
+        endTime: s.endTime,
+        licenseType: s.licenseType,
+        licenseId: s.licenseId,
+      })),
+      upcoming: upcomingSessions.map((s: ScheduledSession) => ({
+        sessionId: s.sessionId,
+        userId: s.userId,
+        username: s.username,
+        title: s.title,
+        startTime: s.startTime,
+        endTime: s.endTime,
+        licenseType: s.licenseType,
+        licenseId: s.licenseId,
+      })),
+    },
+    licenses: {
+      pools: licensePools.map((l: LicensePool) => ({
+        licenseId: l.licenseId,
+        ownerId: l.ownerId,
+        ownerUsername: l.ownerUsername,
+        maxConcurrentUsers: l.maxConcurrentUsers,
+        isActive: l.isActive,
+      })),
+    },
+    activity: {
+      recentlyStarted: recentlyStarted.map((i) => ({
+        userId: i.userId,
+        username: i.sanitizedUsername,
+        startedAt: i.startedAt,
+      })),
+      recentlyUpdated: recentlyUpdated.map((i) => ({
+        userId: i.userId,
+        username: i.sanitizedUsername,
+        updatedAt: i.updatedAt,
+        status: i.status,
+      })),
+    },
+    autoShutdown: shutdownStats,
+  };
+}
+
+async function adminForceShutdown(targetUserId: string, reason?: string) {
+  const instance = await dynamoManager.getInstance(targetUserId);
+  if (!instance) {
+    throw new Error("Target user instance not found");
+  }
+
+  if (instance.status !== "running") {
+    throw new Error("Instance is not running");
+  }
+
+  console.log(
+    `Admin force shutdown: ${targetUserId}, reason: ${
+      reason || "No reason provided"
+    }`
+  );
+
+  // Use the existing stop instance logic
+  await stopInstance(targetUserId);
+
+  // Log the admin action
+  const logMessage = `Admin force shutdown - User: ${
+    instance.sanitizedUsername
+  }, Reason: ${reason || "No reason provided"}`;
+  console.log(logMessage);
+
+  return {
+    message: "Instance force shutdown completed",
+    targetUserId,
+    targetUsername: instance.sanitizedUsername,
+    reason: reason || "No reason provided",
+    timestamp: Math.floor(Date.now() / 1000),
+  };
+}
+
+async function adminCancelSession(sessionId: string, reason?: string) {
+  const session = await dynamoManager.getScheduledSession(sessionId);
+  if (!session) {
+    throw new Error("Session not found");
+  }
+
+  if (session.status === "cancelled") {
+    throw new Error("Session is already cancelled");
+  }
+
+  console.log(
+    `Admin cancel session: ${sessionId}, reason: ${
+      reason || "No reason provided"
+    }`
+  );
+
+  // If session is active, also stop the related instance
+  if (session.status === "active" && session.instanceId) {
+    try {
+      await stopInstance(session.instanceId);
+      console.log(
+        `Stopped instance ${session.instanceId} for cancelled session`
+      );
+    } catch (error) {
+      console.error(`Failed to stop instance for cancelled session:`, error);
+    }
+  }
+
+  // Cancel the session
+  await dynamoManager.updateScheduledSession(sessionId, {
+    status: "cancelled",
+    updatedAt: Math.floor(Date.now() / 1000),
+  });
+
+  // Log the admin action
+  const logMessage = `Admin cancel session - Session: ${sessionId}, User: ${
+    session.username
+  }, Reason: ${reason || "No reason provided"}`;
+  console.log(logMessage);
+
+  return {
+    message: "Session cancelled successfully",
+    sessionId,
+    userId: session.userId,
+    username: session.username,
+    reason: reason || "No reason provided",
+    timestamp: Math.floor(Date.now() / 1000),
+  };
+}
+
+async function adminCancelAllSessions(reason?: string) {
+  console.log(
+    `Admin cancel all sessions, reason: ${reason || "No reason provided"}`
+  );
+
+  // Get all active and scheduled sessions
+  const now = Math.floor(Date.now() / 1000);
+  const allSessions = await dynamoManager.getSessionsInTimeRange(
+    now - 24 * 60 * 60, // Last 24 hours for active sessions
+    now + 7 * 24 * 60 * 60 // Next 7 days for scheduled sessions
+  );
+
+  const sessionsToCancel = allSessions.filter(
+    (s) => s.status === "active" || s.status === "scheduled"
+  );
+
+  if (sessionsToCancel.length === 0) {
+    return {
+      message: "No active or scheduled sessions to cancel",
+      cancelledCount: 0,
+      timestamp: Math.floor(Date.now() / 1000),
+    };
+  }
+
+  let cancelledCount = 0;
+  const errors = [];
+
+  for (const session of sessionsToCancel) {
+    try {
+      // If session is active, also stop the related instance
+      if (session.status === "active" && session.instanceId) {
+        try {
+          await stopInstance(session.instanceId);
+          console.log(
+            `Stopped instance ${session.instanceId} for cancelled session ${session.sessionId}`
+          );
+        } catch (error) {
+          console.error(
+            `Failed to stop instance for session ${session.sessionId}:`,
+            error
+          );
+        }
+      }
+
+      // Cancel the session
+      await dynamoManager.updateScheduledSession(session.sessionId, {
+        status: "cancelled",
+        updatedAt: now,
+      });
+
+      cancelledCount++;
+    } catch (error) {
+      errors.push(
+        `${session.sessionId}: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  // Log the admin action
+  const logMessage = `Admin cancel all sessions - ${cancelledCount} sessions cancelled, Reason: ${
+    reason || "No reason provided"
+  }`;
+  console.log(logMessage);
+
+  return {
+    message: `Cancelled ${cancelledCount}/${sessionsToCancel.length} sessions`,
+    cancelledCount,
+    totalSessions: sessionsToCancel.length,
+    errors: errors.length > 0 ? errors : undefined,
+    reason: reason || "No reason provided",
+    timestamp: now,
+  };
+}
+
+async function adminSystemMaintenance(reason?: string) {
+  console.log(
+    `Admin system maintenance mode, reason: ${reason || "No reason provided"}`
+  );
+
+  const now = Math.floor(Date.now() / 1000);
+
+  // Get all running instances and active sessions
+  const allInstances = await dynamoManager.getAllInstances();
+  const runningInstances = allInstances.filter((i) => i.status === "running");
+
+  const allSessions = await dynamoManager.getSessionsInTimeRange(
+    now - 24 * 60 * 60,
+    now + 7 * 24 * 60 * 60
+  );
+  const activeSessions = allSessions.filter(
+    (s) => s.status === "active" || s.status === "scheduled"
+  );
+
+  let shutdownCount = 0;
+  let cancelledCount = 0;
+  const errors = [];
+
+  // Cancel all sessions first
+  for (const session of activeSessions) {
+    try {
+      await dynamoManager.updateScheduledSession(session.sessionId, {
+        status: "cancelled",
+        updatedAt: now,
+      });
+      cancelledCount++;
+    } catch (error) {
+      errors.push(
+        `Session ${session.sessionId}: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  // Then shutdown all instances
+  for (const instance of runningInstances) {
+    try {
+      await stopInstance(instance.userId);
+      shutdownCount++;
+    } catch (error) {
+      errors.push(
+        `Instance ${instance.sanitizedUsername}: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  // Log the admin action
+  const logMessage = `Admin system maintenance - ${shutdownCount} instances shutdown, ${cancelledCount} sessions cancelled, Reason: ${
+    reason || "No reason provided"
+  }`;
+  console.log(logMessage);
+
+  return {
+    message: "System maintenance mode activated",
+    shutdownCount,
+    cancelledCount,
+    totalInstances: runningInstances.length,
+    totalSessions: activeSessions.length,
+    errors: errors.length > 0 ? errors : undefined,
+    reason: reason || "No reason provided",
+    timestamp: now,
   };
 }
 
