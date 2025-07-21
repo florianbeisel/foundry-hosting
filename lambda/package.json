@@ -10,15 +10,15 @@
     "deploy": "npm run package && aws lambda update-function-code --function-name $FUNCTION_NAME --zip-file fileb://function.zip"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.848.0",
     "@aws-sdk/client-ecs": "^3.462.0",
     "@aws-sdk/client-efs": "^3.462.0",
-    "@aws-sdk/client-secrets-manager": "^3.462.0",
-    "@aws-sdk/client-dynamodb": "^3.462.0",
-    "@aws-sdk/lib-dynamodb": "^3.462.0",
-    "@aws-sdk/client-s3": "^3.462.0",
-    "@aws-sdk/client-iam": "^3.462.0",
     "@aws-sdk/client-elastic-load-balancing-v2": "^3.462.0",
+    "@aws-sdk/client-iam": "^3.462.0",
     "@aws-sdk/client-route-53": "^3.462.0",
+    "@aws-sdk/client-s3": "^3.462.0",
+    "@aws-sdk/client-secrets-manager": "^3.462.0",
+    "@aws-sdk/lib-dynamodb": "^3.462.0",
     "uuid": "^9.0.1"
   },
   "devDependencies": {

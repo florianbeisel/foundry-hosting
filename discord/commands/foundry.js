@@ -11,7 +11,7 @@ const {
 module.exports = {
   data: new SlashCommandBuilder()
     .setName("foundry")
-    .setDescription("Foundry VTT instance management")
+    .setDescription("Manage your Foundry VTT instance from Discord.")
     .addSubcommand((subcommand) =>
       subcommand
         .setName("dashboard")
@@ -381,44 +381,26 @@ async function handleDashboard(interaction, userId) {
 async function handleHelp(interaction) {
   const embed = new EmbedBuilder()
     .setColor("#0099ff")
-    .setTitle("🎲 Foundry VTT Bot Help")
-    .setDescription("Interactive Foundry Virtual Tabletop instance management")
+    .setTitle("Foundry VTT Bot Help")
+    .setDescription("Manage Foundry VTT instances directly from Discord.")
     .addFields([
       {
-        name: "🚀 Getting Started",
+        name: "Getting Started",
         value:
-          "1. Use `/foundry dashboard` to see your status\n" +
-          '2. Click "Register" if you don\'t have an instance\n' +
-          "3. Use the buttons to start/stop your instance\n" +
-          "4. Get your own command channel for monitoring",
+          "• `/foundry dashboard` – view status or register an instance\n" +
+          "• Use the provided buttons to start or stop your instance\n" +
+          "• Follow updates in your personal command channel",
       },
       {
-        name: "📋 Commands",
+        name: "Commands",
         value:
-          "`/foundry dashboard` - Your main control panel\n" +
-          "`/foundry help` - Show this help\n" +
-          "*Most actions are done via interactive buttons*",
-      },
-      {
-        name: "🎮 Features",
-        value:
-          "• Button-driven interface\n" +
-          "• Private command channels\n" +
-          "• Real-time status monitoring\n" +
-          "• Automatic startup notifications\n" +
-          "• Secure credential collection",
-      },
-      {
-        name: "💡 How It Works",
-        value:
-          "1. Register with your Foundry credentials (via DM)\n" +
-          "2. Get your own private command channel\n" +
-          "3. Start your instance when ready to play\n" +
-          "4. Monitor startup progress in real-time\n" +
-          "5. Stop when done to save costs",
+          "`/foundry dashboard` – personal control panel\n" +
+          "`/foundry help` – this help message\n" +
+          "`/foundry setup-registration` – post registration embed (admin)\n" +
+          "`/admin-status` – system-wide status (admin)",
       },
     ])
-    .setFooter({ text: "Need help? Contact an admin" })
+    .setFooter({ text: "Need more information? Contact an administrator." })
     .setTimestamp();
 
   await interaction.reply({ embeds: [embed], ephemeral: true });
@@ -427,36 +409,25 @@ async function handleHelp(interaction) {
 function createRegistrationEmbed() {
   return new EmbedBuilder()
     .setColor("#0099ff")
-    .setTitle("🎲 Welcome to Foundry VTT Hosting!")
-    .setDescription("Get your own private Foundry VTT server in the cloud!")
+    .setTitle("Register Your Foundry VTT Instance")
+    .setDescription("Create and manage a personal Foundry VTT instance.")
     .addFields([
       {
-        name: "🎮 What You Get",
+        name: "Instance Details",
         value:
-          "• Your own private Foundry VTT server\n• Custom username-based URL\n• Full admin access with your admin key",
+          "• Dedicated Foundry VTT server\n• Custom URL based on your username\n• Full admin access",
       },
       {
-        name: "🔒 Security & Privacy",
-        value:
-          "• Isolated instance with your own URL\n• Encrypted credentials storage\n• Private command channel for control",
+        name: "Costs",
+        value: "• Billed only while the instance is running\n• No upfront fees",
       },
       {
-        name: "💰 Cost Effective",
+        name: "Management",
         value:
-          "• Pay only while running (~$8-12/month)\n• No upfront costs\n• Start and stop anytime",
-      },
-      {
-        name: "💾 Data Persistence",
-        value:
-          "• Your worlds are saved between sessions\n• All assets and modules preserved\n• Automatic backups to EFS storage",
-      },
-      {
-        name: "🚀 Easy Management",
-        value:
-          "• Start/stop with Discord buttons\n• Real-time status monitoring\n• Admin key retrieval anytime",
+          "• Control via Discord buttons\n• Real-time status updates\n• Retrieve admin key as needed",
       },
     ])
-    .setFooter({ text: "Click the button below to get started!" })
+    .setFooter({ text: "Click Register to continue." })
     .setTimestamp();
 }
 
@@ -492,6 +463,54 @@ async function handleSetupRegistration(interaction) {
       embeds: [embed],
       components: [actionRow],
     });
+
+    // Create statistics message below the registration card
+    try {
+      const summaryResponse = await interaction.invokeLambda({
+        action: "admin-overview",
+        userId: interaction.user.id,
+      });
+
+      const summary = summaryResponse.summary;
+
+      const COST_PER_HOUR = parseFloat(
+        process.env.INSTANCE_COST_PER_HOUR || "0.10"
+      );
+
+      const costLine =
+        summary && summary.estimatedMonthlyCost !== undefined
+          ? `**Monthly Cost (so far):** $${summary.estimatedMonthlyCost.toFixed(
+              2
+            )}`
+          : `**Monthly Cost (est.):** $${(
+              summary?.runningInstances * COST_PER_HOUR * 720 || 0
+            ).toFixed(2)}`;
+
+      const statsEmbed = new EmbedBuilder()
+        .setColor("#0099ff")
+        .setTitle("Instance Statistics")
+        .setDescription(
+          summary
+            ? [
+                `**Total Instances:** ${summary.totalInstances}`,
+                `**Running:** ${summary.runningInstances}`,
+                `**BYOL:** ${summary.byolInstances}`,
+                `**Pooled:** ${summary.pooledInstances}`,
+                costLine,
+              ].join(" | ")
+            : "Statistics unavailable."
+        )
+        .setTimestamp();
+
+      const statsMessage = await channel.send({ embeds: [statsEmbed] });
+
+      // Register stats message for periodic updates handled in index.js
+      if (interaction.addRegistrationStatsMapping) {
+        interaction.addRegistrationStatsMapping(channel.id, statsMessage.id);
+      }
+    } catch (statsErr) {
+      console.error("Failed to send statistics message:", statsErr.message);
+    }
 
     await interaction.editReply({
       content: `✅ Registration message posted in ${channel}!\n\nMessage ID: \`${message.id}\`\n\nUsers can now click the button to register for Foundry VTT hosting.`,

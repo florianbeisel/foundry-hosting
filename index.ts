@@ -507,6 +507,32 @@ const licenseReservationsTable = new aws.dynamodb.Table(
   }
 );
 
+// Usage tracking table
+const usageTable = new aws.dynamodb.Table(`${projectName}-usage`, {
+  name: `${projectName}-usage`,
+  billingMode: "PAY_PER_REQUEST",
+  hashKey: "usageKey",
+  attributes: [{ name: "usageKey", type: "S" }],
+  serverSideEncryption: { enabled: true },
+  tags: {
+    Name: `${projectName}-usage`,
+    Environment: environment,
+  },
+});
+
+// Bot configuration table (stores registration message IDs, etc.)
+const botConfigTable = new aws.dynamodb.Table(`${projectName}-bot-config`, {
+  name: `${projectName}-bot-config`,
+  billingMode: "PAY_PER_REQUEST",
+  hashKey: "configKey",
+  attributes: [{ name: "configKey", type: "S" }],
+  serverSideEncryption: { enabled: true },
+  tags: {
+    Name: `${projectName}-bot-config`,
+    Environment: environment,
+  },
+});
+
 // Legacy schedule tracking table (keeping for backward compatibility)
 const scheduleTable = new aws.dynamodb.Table(`${projectName}-schedules`, {
   name: `${projectName}-schedules`,
@@ -669,6 +695,7 @@ const instanceManagementLambda = new aws.lambda.Function(
         LICENSE_POOL_TABLE_NAME: licensePoolTable.name,
         SCHEDULED_SESSIONS_TABLE_NAME: scheduledSessionsTable.name,
         LICENSE_RESERVATIONS_TABLE_NAME: licenseReservationsTable.name,
+        USAGE_TABLE_NAME: usageTable.name,
         FILE_SYSTEM_ID: fileSystem.id,
         VPC_ID: vpc.vpcId,
         PRIVATE_SUBNET_IDS: vpc.privateSubnetIds.apply((ids) => ids.join(",")),
@@ -944,6 +971,27 @@ new aws.iam.RolePolicy(`${projectName}-task-lambda-invoke-policy`, {
   ),
 });
 
+// IAM: add dynamodb access for bot task role
+new aws.iam.RolePolicy(`${projectName}-task-botconfig-policy`, {
+  role: taskRole.id,
+  policy: pulumi.all([botConfigTable.arn]).apply(([tableArn]) =>
+    JSON.stringify({
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Effect: "Allow",
+          Action: [
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+          ],
+          Resource: tableArn,
+        },
+      ],
+    })
+  ),
+});
+
 // =================
 // UPDATED EXPORTS FOR DISCORD BOT
 // =================
@@ -1076,6 +1124,7 @@ export const scheduleTableName = scheduleTable.name;
 export const licensePoolTableName = licensePoolTable.name;
 export const scheduledSessionsTableName = scheduledSessionsTable.name;
 export const licenseReservationsTableName = licenseReservationsTable.name;
+export const botConfigTableName = botConfigTable.name;
 export const lambdaFunctionName = instanceManagementLambda.name;
 export const vpcId = vpc.vpcId;
 export const privateSubnetIds = vpc.privateSubnetIds;
@@ -1104,6 +1153,8 @@ export const outputs = {
     licensePoolTable: licensePoolTableName,
     scheduledSessionsTable: scheduledSessionsTableName,
     licenseReservationsTable: licenseReservationsTableName,
+    botConfigTable: botConfigTableName,
+    usageTable: usageTable.name,
   },
   lambda: {
     functionName: lambdaFunctionName,

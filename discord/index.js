@@ -16,6 +16,91 @@ const {
 } = require("discord.js");
 const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
 const cron = require("node-cron");
+const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+} = require("@aws-sdk/lib-dynamodb");
+
+const botConfigTableName = process.env.BOT_CONFIG_TABLE_NAME;
+let botConfigDynamo = null;
+if (botConfigTableName) {
+  const ddbClient = new DynamoDBClient({
+    region: process.env.AWS_REGION || "us-east-1",
+  });
+  botConfigDynamo = DynamoDBDocumentClient.from(ddbClient);
+}
+
+async function loadRegistrationStatsMappingFromDB() {
+  if (!botConfigDynamo) return null;
+  try {
+    const res = await botConfigDynamo.send(
+      new GetCommand({
+        TableName: botConfigTableName,
+        Key: { configKey: "registrationStats" },
+      })
+    );
+    return res.Item || null;
+  } catch (err) {
+    console.error("Failed to load registration mapping:", err.message);
+    return null;
+  }
+}
+
+async function saveRegistrationStatsMappingToDB(channelId, messageId) {
+  if (!botConfigDynamo) return;
+  try {
+    await botConfigDynamo.send(
+      new PutCommand({
+        TableName: botConfigTableName,
+        Item: {
+          configKey: "registrationStats",
+          channelId,
+          messageId,
+          updatedAt: Math.floor(Date.now() / 1000),
+        },
+      })
+    );
+  } catch (err) {
+    console.error("Failed to save registration mapping:", err.message);
+  }
+}
+
+async function loadAdminStatusMappingFromDB() {
+  if (!botConfigDynamo) return null;
+  try {
+    const res = await botConfigDynamo.send(
+      new GetCommand({
+        TableName: botConfigTableName,
+        Key: { configKey: "adminStatus" },
+      })
+    );
+    return res.Item || null;
+  } catch (err) {
+    console.error("Failed to load admin status mapping:", err.message);
+    return null;
+  }
+}
+
+async function saveAdminStatusMappingToDB(channelId, messageId) {
+  if (!botConfigDynamo) return;
+  try {
+    await botConfigDynamo.send(
+      new PutCommand({
+        TableName: botConfigTableName,
+        Item: {
+          configKey: "adminStatus",
+          channelId,
+          messageId,
+          updatedAt: Math.floor(Date.now() / 1000),
+        },
+      })
+    );
+  } catch (err) {
+    console.error("Failed to save admin status mapping:", err.message);
+  }
+}
 
 // Initialize Discord client
 const client = new Client({
@@ -37,11 +122,26 @@ client.commands = new Collection();
 client.userChannels = new Map(); // userId -> channelId
 client.statusMonitors = new Map(); // userId -> interval
 
-// Import commands
-const foundryCommand = require("./commands/foundry");
-const adminCommand = require("./commands/admin");
-client.commands.set(foundryCommand.data.name, foundryCommand);
-client.commands.set(adminCommand.data.name, adminCommand);
+// Map of registration channels to their statistics message IDs
+client.registrationStats = new Map(); // channelId -> statsMessageId
+
+// Map of admin status channels to their status message IDs
+client.adminStatusMapping = new Map(); // channelId -> adminStatusMessageId
+
+// Dynamically import all command modules
+const fs = require("node:fs");
+const path = require("node:path");
+
+const commandsPath = path.join(__dirname, "commands");
+
+fs.readdirSync(commandsPath)
+  .filter((file) => file.endsWith(".js"))
+  .forEach((file) => {
+    const command = require(path.join(commandsPath, file));
+    if (command?.data && typeof command.execute === "function") {
+      client.commands.set(command.data.name, command);
+    }
+  });
 
 // Helper function to sanitize Discord username for URL use
 function sanitizeUsername(username) {
@@ -636,6 +736,9 @@ async function sendInstanceControlPanel(channel, userId, status) {
     components: [actionRow],
     content: `<@${userId}> Your Foundry VTT instance is ready!`,
   });
+
+  // Refresh stats after state change
+  await refreshRegistrationStats();
 }
 
 // Helper function to sync all running instances on bot startup
@@ -965,6 +1068,24 @@ client.once("ready", async () => {
   // Clean up any orphaned status monitors on restart
   client.statusMonitors.clear();
 
+  // Restore registration stats mapping from DB
+  if (botConfigTableName) {
+    const mapping = await loadRegistrationStatsMappingFromDB();
+    if (mapping && mapping.channelId && mapping.messageId) {
+      client.registrationStats.set(mapping.channelId, mapping.messageId);
+      console.log("✅ Restored registration stats mapping from DynamoDB");
+    }
+  }
+
+  // Restore admin status mapping
+  if (botConfigTableName) {
+    const adminMap = await loadAdminStatusMappingFromDB();
+    if (adminMap && adminMap.channelId && adminMap.messageId) {
+      client.adminStatusMapping.set(adminMap.channelId, adminMap.messageId);
+      console.log("✅ Restored admin status mapping from DynamoDB");
+    }
+  }
+
   // Sync all running instances
   await syncAllInstances();
 });
@@ -1017,6 +1138,14 @@ async function handleSlashCommand(interaction) {
     interaction.deleteUserCommandChannel = (userId) =>
       deleteUserCommandChannel(interaction.guild, userId);
     interaction.startStatusMonitoring = startStatusMonitoring;
+    interaction.addRegistrationStatsMapping = (channelId, messageId) => {
+      client.registrationStats.set(channelId, messageId);
+      saveRegistrationStatsMappingToDB(channelId, messageId);
+    };
+    interaction.addAdminStatusMapping = (channelId, messageId) => {
+      client.adminStatusMapping.set(channelId, messageId);
+      saveAdminStatusMappingToDB(channelId, messageId);
+    };
 
     await command.execute(interaction);
   } catch (error) {
@@ -4023,6 +4152,130 @@ async function handleSessionsButton(interaction, userId) {
     await interaction.editReply({ embeds: [errorEmbed] });
   }
 }
+
+// Helper function to fetch system summary for stats embeds
+async function fetchSystemSummary() {
+  try {
+    const response = await invokeLambda({
+      action: "admin-overview",
+      userId: "system",
+    });
+    return response.summary || null;
+  } catch (err) {
+    console.error("Failed to fetch system summary:", err.message);
+    return null;
+  }
+}
+
+async function buildStatsEmbed() {
+  const summary = await fetchSystemSummary();
+  if (!summary) {
+    return new EmbedBuilder()
+      .setColor("#ff0000")
+      .setTitle("Instance Statistics")
+      .setDescription("Unable to retrieve statistics at this time.");
+  }
+
+  const COST_PER_HOUR = parseFloat(
+    process.env.INSTANCE_COST_PER_HOUR || "0.10"
+  );
+  const costLine =
+    summary.estimatedMonthlyCost !== undefined
+      ? `**Monthly Cost (so far):** $${summary.estimatedMonthlyCost.toFixed(2)}`
+      : `**Monthly Cost (estimate):** $${(
+          summary.runningInstances *
+          COST_PER_HOUR *
+          720
+        ).toFixed(2)}`;
+
+  return new EmbedBuilder()
+    .setColor("#0099ff")
+    .setTitle("Instance Statistics")
+    .setDescription(
+      [
+        `**Total Instances:** ${summary.totalInstances}`,
+        `**Running:** ${summary.runningInstances}`,
+        `**BYOL:** ${summary.byolInstances}`,
+        `**Pooled:** ${summary.pooledInstances}`,
+        costLine,
+      ].join(" | ")
+    )
+    .setTimestamp();
+}
+
+// Periodically update all registration stats messages (every 5 minutes)
+cron.schedule("*/5 * * * *", async () => {
+  for (const [channelId, messageId] of client.registrationStats.entries()) {
+    try {
+      const channel = await client.channels.fetch(channelId);
+      if (!channel) continue;
+
+      const message = await channel.messages.fetch(messageId);
+      if (!message) continue;
+
+      const embed = await buildStatsEmbed();
+      await message.edit({ embeds: [embed] });
+    } catch (err) {
+      console.error(
+        `Failed to update stats message in ${channelId}:`,
+        err.message
+      );
+    }
+  }
+});
+
+// Function to refresh all stats embeds in registration channels
+async function refreshRegistrationStats() {
+  if (client.registrationStats.size === 0) return;
+  try {
+    const embed = await buildStatsEmbed();
+    for (const [channelId, messageId] of client.registrationStats.entries()) {
+      try {
+        const channel = await client.channels.fetch(channelId);
+        if (!channel) continue;
+        const message = await channel.messages.fetch(messageId);
+        if (!message) continue;
+        await message.edit({ embeds: [embed] });
+      } catch (err) {
+        console.error(`Failed to refresh stats in ${channelId}:`, err.message);
+      }
+    }
+  } catch (e) {
+    console.error("Failed to build stats embed:", e.message);
+  }
+}
+
+async function buildAdminStatusEmbed() {
+  const response = await invokeLambda({
+    action: "admin-overview",
+    userId: "system",
+  });
+  const summary = response.summary;
+  return new EmbedBuilder()
+    .setColor("#0099ff")
+    .setTitle("System Administration Dashboard")
+    .setDescription(
+      `Running: ${summary.runningInstances}/${summary.totalInstances} | Sessions: ${summary.activeSessions}`
+    )
+    .setTimestamp();
+}
+
+// Cron refresh admin status every 5 minutes
+cron.schedule("*/5 * * * *", async () => {
+  if (client.adminStatusMapping.size === 0) return;
+  const embed = await buildAdminStatusEmbed();
+  for (const [channelId, messageId] of client.adminStatusMapping.entries()) {
+    try {
+      const channel = await client.channels.fetch(channelId);
+      if (!channel) continue;
+      const msg = await channel.messages.fetch(messageId);
+      if (!msg) continue;
+      await msg.edit({ embeds: [embed] });
+    } catch (err) {
+      console.error("Failed to refresh admin status:", err.message);
+    }
+  }
+});
 
 // Login to Discord
 client.login(process.env.DISCORD_TOKEN);

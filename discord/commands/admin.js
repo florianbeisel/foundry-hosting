@@ -15,7 +15,7 @@ const lambda = new LambdaClient({
 module.exports = {
   data: new SlashCommandBuilder()
     .setName("admin-status")
-    .setDescription("📊 Admin: View comprehensive system status and monitoring")
+    .setDescription("View system status and monitoring details")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   async execute(interaction) {
@@ -79,7 +79,7 @@ module.exports = {
       // Create main status embed
       const statusEmbed = new EmbedBuilder()
         .setTitle("🔧 System Administration Dashboard")
-        .setDescription("Comprehensive system status and monitoring overview")
+        .setDescription("Current system status overview")
         .setColor(0x00ff00)
         .setTimestamp();
 
@@ -253,10 +253,64 @@ module.exports = {
           .setStyle(ButtonStyle.Danger)
       );
 
-      await interaction.editReply({
-        embeds: [statusEmbed],
-        components: [actionRow],
-      });
+      // Find or create admin status channel
+      let statusChannel;
+      if (interaction.guild) {
+        const existing = interaction.guild.channels.cache.find(
+          (c) => c.name === "foundry-admin-status"
+        );
+        if (existing) {
+          statusChannel = existing;
+        } else {
+          statusChannel = await interaction.guild.channels.create({
+            name: "foundry-admin-status",
+            type: 0, // GUILD_TEXT
+            permissionOverwrites: [
+              {
+                id: interaction.guild.roles.everyone,
+                deny: [PermissionFlagsBits.ViewChannel],
+              },
+              {
+                id: interaction.member.id,
+                allow: [PermissionFlagsBits.ViewChannel],
+              },
+            ],
+          });
+        }
+      }
+
+      let messageId = null;
+      if (statusChannel) {
+        // Check if mapping exists in memory
+        const existingMsgId = interaction.client.adminStatusMapping.get(
+          statusChannel.id
+        );
+        if (existingMsgId) {
+          try {
+            const msg = await statusChannel.messages.fetch(existingMsgId);
+            await msg.edit({ embeds: [statusEmbed] });
+            messageId = existingMsgId;
+          } catch {
+            // message not found, fallthrough to send new
+          }
+        }
+        if (!messageId) {
+          const sent = await statusChannel.send({ embeds: [statusEmbed] });
+          messageId = sent.id;
+        }
+
+        // Store mapping
+        if (interaction.addAdminStatusMapping) {
+          interaction.addAdminStatusMapping(statusChannel.id, messageId);
+        }
+
+        await interaction.editReply({
+          content: `✅ Updated admin status in ${statusChannel}`,
+          ephemeral: true,
+        });
+      } else {
+        await interaction.editReply({ embeds: [statusEmbed], ephemeral: true });
+      }
     } catch (error) {
       console.error("Admin status error:", error);
       await interaction.editReply({

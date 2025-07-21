@@ -18,6 +18,7 @@ import { S3Manager } from "./utils/s3-manager";
 import { IAMManager } from "./utils/iam-manager";
 import { LicenseScheduler } from "./utils/license-scheduler";
 import { AutoShutdownManager } from "./utils/auto-shutdown-manager";
+import { UsageManager } from "./utils/usage-manager";
 
 interface FoundryEvent {
   action:
@@ -95,6 +96,8 @@ const autoShutdownManager = new AutoShutdownManager(
   albManager,
   licenseScheduler
 );
+
+const usageManager = new UsageManager(process.env.USAGE_TABLE_NAME!);
 
 export const handler = async (
   event: FoundryEvent,
@@ -567,6 +570,8 @@ async function startInstance(userId: string) {
     updatedAt: now,
   });
 
+  // Record usage start
+  await usageManager.recordStart(userId, now);
   return {
     message: "Instance is running",
     userId,
@@ -582,6 +587,7 @@ async function stopInstance(userId: string) {
     throw new Error("Instance not found");
   }
 
+  const startedAt = instance.startedAt;
   // Deregister from ALB first
   if (instance.taskPrivateIp && instance.targetGroupArn) {
     await albManager.deregisterTaskFromTargetGroup(
@@ -611,6 +617,11 @@ async function stopInstance(userId: string) {
     updatedAt: Math.floor(Date.now() / 1000),
   });
 
+  // Record usage stop if we had a start timestamp
+  if (startedAt) {
+    const stopTs = Math.floor(Date.now() / 1000);
+    await usageManager.recordStop(userId, startedAt, stopTs);
+  }
   return {
     message: "Instance is stopped",
     userId,
@@ -1269,6 +1280,21 @@ async function getAdminOverview() {
     (i) => i.updatedAt > recentThreshold
   );
 
+  // Aggregate usage hours for current month
+  let totalHoursThisMonth = 0;
+  try {
+    totalHoursThisMonth = await usageManager.getCurrentMonthUsage();
+  } catch (err) {
+    console.error("Failed to aggregate monthly usage:", err);
+  }
+
+  const COST_PER_HOUR = parseFloat(
+    process.env.INSTANCE_COST_PER_HOUR || "0.10"
+  );
+  const estimatedMonthlyCost = parseFloat(
+    (totalHoursThisMonth * COST_PER_HOUR).toFixed(2)
+  );
+
   return {
     timestamp: now,
     summary: {
@@ -1280,6 +1306,8 @@ async function getAdminOverview() {
       activeSessions: activeSessions.length,
       upcomingSessions: upcomingSessions.length,
       instancesWithTimers: instancesWithTimers.length,
+      totalHoursThisMonth,
+      estimatedMonthlyCost,
     },
     instances: {
       running: runningInstances.map((i) => ({

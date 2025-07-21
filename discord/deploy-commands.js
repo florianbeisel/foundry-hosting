@@ -1,9 +1,20 @@
 require("dotenv").config();
 const { REST, Routes } = require("discord.js");
-const foundryCommand = require("./commands/foundry");
-const adminCommand = require("./commands/admin");
+const fs = require("node:fs");
+const path = require("node:path");
 
-const commands = [foundryCommand.data.toJSON(), adminCommand.data.toJSON()];
+// Dynamically load all command modules in ./commands and collect their JSON definitions
+const commands = [];
+const commandsPath = path.join(__dirname, "commands");
+
+fs.readdirSync(commandsPath)
+  .filter((file) => file.endsWith(".js"))
+  .forEach((file) => {
+    const command = require(path.join(commandsPath, file));
+    if (command?.data) {
+      commands.push(command.data.toJSON());
+    }
+  });
 
 const rest = new REST().setToken(process.env.DISCORD_TOKEN);
 

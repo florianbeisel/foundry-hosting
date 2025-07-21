@@ -18,7 +18,9 @@
     "update-service": "aws ecs update-service --cluster ${ECS_CLUSTER_NAME:-foundry-vtt-cluster} --service ${ECS_SERVICE_NAME:-foundry-vtt-discord-bot} --force-new-deployment"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.848.0",
     "@aws-sdk/client-lambda": "^3.848.0",
+    "@aws-sdk/lib-dynamodb": "^3.848.0",
     "discord.js": "^14.21.0",
     "dotenv": "^17.2.0",
     "node-cron": "^3.0.3"
