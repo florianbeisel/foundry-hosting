@@ -217,6 +217,9 @@ async function invokeLambda(payload) {
 
 // Helper functions for permissions and channels
 function hasRequiredRole(member) {
+  // Handle null member (DMs or missing member info)
+  if (!member || !member.roles) return false;
+
   const allowedRoles = process.env.ALLOWED_ROLES?.split(",") || [];
 
   // Filter out empty strings and check if any real roles remain
@@ -231,6 +234,9 @@ function hasRequiredRole(member) {
 }
 
 function hasAdminRole(member) {
+  // Handle null member (DMs or missing member info)
+  if (!member || !member.roles || !member.permissions) return false;
+
   // Check Discord's built-in Administrator permission first
   if (member.permissions.has("Administrator")) {
     return true;
@@ -465,7 +471,7 @@ function startStatusMonitoring(userId, channelId) {
 
       stopStatusMonitoring(userId);
     }
-  }, 15000); // Check every 15 seconds
+  }, 20000); // Check every 20 seconds (optimized from 15s to reduce Lambda invocations)
 
   client.statusMonitors.set(userId, monitorInterval);
 }
@@ -488,6 +494,28 @@ async function sendStatusUpdate(channel, status) {
     unknown: "❔",
   };
 
+  // Get license owner info for gratitude display on pooled instances
+  let licenseOwnerInfo = null;
+  if (status.licenseType === "pooled" && status.licenseOwnerId) {
+    try {
+      const adminResult = await invokeLambda({
+        action: "admin-overview",
+        userId: status.userId,
+      });
+
+      if (adminResult.licenses && adminResult.licenses.pools) {
+        const licensePool = adminResult.licenses.pools.find(
+          (pool) => pool.licenseId === status.licenseOwnerId
+        );
+        if (licensePool) {
+          licenseOwnerInfo = licensePool.ownerUsername;
+        }
+      }
+    } catch (error) {
+      console.log("Could not fetch license owner info for status display");
+    }
+  }
+
   const embed = new EmbedBuilder()
     .setColor(status.status === "starting" ? "#ffff00" : "#888888")
     .setTitle(`${statusEmoji[status.status]} Instance Status`)
@@ -498,6 +526,15 @@ async function sendStatusUpdate(channel, status) {
         value: `<t:${status.updatedAt}:R>`,
         inline: true,
       },
+      ...(licenseOwnerInfo
+        ? [
+            {
+              name: "🤝 License Shared By",
+              value: `Thanks to **${licenseOwnerInfo}** for sharing their license!`,
+              inline: false,
+            },
+          ]
+        : []),
     ])
     .setTimestamp();
 
@@ -511,6 +548,28 @@ async function sendStatusUpdate(channel, status) {
 }
 
 async function sendInstanceControlPanel(channel, userId, status) {
+  // Get license owner info for gratitude display
+  let licenseOwnerInfo = null;
+  if (status.licenseType === "pooled" && status.licenseOwnerId) {
+    try {
+      const adminResult = await invokeLambda({
+        action: "admin-overview",
+        userId: userId,
+      });
+
+      if (adminResult.licenses && adminResult.licenses.pools) {
+        const licensePool = adminResult.licenses.pools.find(
+          (pool) => pool.licenseId === status.licenseOwnerId
+        );
+        if (licensePool) {
+          licenseOwnerInfo = licensePool.ownerUsername;
+        }
+      }
+    } catch (error) {
+      console.log("Could not fetch license owner info for gratitude display");
+    }
+  }
+
   const embed = new EmbedBuilder()
     .setColor("#00ff00")
     .setTitle("🎲 Instance Running")
@@ -519,6 +578,15 @@ async function sendInstanceControlPanel(channel, userId, status) {
       { name: "Status", value: "🟢 Running", inline: true },
       { name: "URL", value: status.url || "URL not available", inline: false },
       { name: "Started", value: `<t:${status.updatedAt}:R>`, inline: true },
+      ...(licenseOwnerInfo
+        ? [
+            {
+              name: "🤝 License Shared By",
+              value: `Thanks to **${licenseOwnerInfo}** for sharing their license!`,
+              inline: false,
+            },
+          ]
+        : []),
       ...(status.foundryVersion
         ? [
             {
@@ -612,6 +680,79 @@ async function syncAllInstances() {
           // Clear ALL messages from the command channel for visibility
           await clearChannelMessages(channel);
 
+          // Get license owner info for pooled instances
+          let licenseOwnerInfo = null;
+          if (instance.licenseType === "pooled" && instance.licenseOwnerId) {
+            try {
+              const adminResult = await invokeLambda({
+                action: "admin-overview",
+                userId: instance.userId,
+              });
+
+              if (adminResult.licenses && adminResult.licenses.pools) {
+                const licensePool = adminResult.licenses.pools.find(
+                  (pool) => pool.licenseId === instance.licenseOwnerId
+                );
+                if (licensePool) {
+                  licenseOwnerInfo = licensePool.ownerUsername;
+                }
+              }
+            } catch (error) {
+              console.log("Could not fetch license owner info for sync");
+            }
+          }
+
+          // Determine license display - be more careful with missing data
+          let licenseDisplay;
+          const licenseType = instance.licenseType;
+
+          // Debug logging for license type detection
+          console.log(`🔍 License Debug for ${instance.sanitizedUsername}:`, {
+            licenseType: instance.licenseType,
+            licenseOwnerId: instance.licenseOwnerId,
+            allowLicenseSharing: instance.allowLicenseSharing,
+            userId: instance.userId,
+            expectedByolId: `byol-${instance.userId}`,
+          });
+
+          if (!licenseType) {
+            // Handle missing license type - check other indicators
+            if (
+              instance.licenseOwnerId &&
+              instance.licenseOwnerId !== `byol-${instance.userId}`
+            ) {
+              // Has a license owner that's not themselves = pooled instance
+              console.log(
+                `✅ Detected as pooled instance (no licenseType but has different licenseOwnerId)`
+              );
+              licenseDisplay = licenseOwnerInfo
+                ? `🌐 Pooled (${licenseOwnerInfo}'s License)`
+                : "🌐 Pooled - Smart License Assignment";
+            } else {
+              // Default to BYOL for missing data
+              console.log(
+                `⚠️ Defaulting to BYOL (missing licenseType, no different licenseOwnerId)`
+              );
+              licenseDisplay = instance.allowLicenseSharing
+                ? "🤝 BYOL - Sharing with Community"
+                : "🔐 BYOL - Private License";
+            }
+          } else if (licenseType === "byol") {
+            console.log(`✅ Confirmed BYOL license type`);
+            licenseDisplay = instance.allowLicenseSharing
+              ? "🤝 BYOL - Sharing with Community"
+              : "🔐 BYOL - Private License";
+          } else if (licenseType === "pooled") {
+            console.log(`✅ Confirmed pooled license type`);
+            licenseDisplay = licenseOwnerInfo
+              ? `🌐 Pooled (${licenseOwnerInfo}'s License)`
+              : "🌐 Pooled - Smart License Assignment";
+          } else {
+            // Unknown license type
+            console.log(`❓ Unknown license type: ${licenseType}`);
+            licenseDisplay = `❔ Unknown License Type: ${licenseType}`;
+          }
+
           // Send a welcome message to indicate bot restart and sync
           const welcomeEmbed = new EmbedBuilder()
             .setColor("#00ff00")
@@ -626,56 +767,163 @@ async function syncAllInstances() {
                 inline: true,
               },
               {
+                name: "License Type",
+                value: licenseDisplay,
+                inline: true,
+              },
+              {
                 name: "Last Updated",
                 value: `<t:${instance.updatedAt}:R>`,
                 inline: true,
               },
+              {
+                name: "Your URL",
+                value: instance.url || "Available after startup",
+                inline: false,
+              },
+              {
+                name: "Foundry Version",
+                value: `\`felddy/foundryvtt:${
+                  instance.foundryVersion || "13"
+                }\``,
+                inline: true,
+              },
+              ...(licenseType === "pooled"
+                ? [
+                    {
+                      name: "Access Rules",
+                      value:
+                        "⚠️ Schedule-only access - optimal license assigned automatically",
+                      inline: true,
+                    },
+                  ]
+                : []),
+              ...(licenseOwnerInfo
+                ? [
+                    {
+                      name: "🤝 License Shared By",
+                      value: `Thanks to **${licenseOwnerInfo}** for sharing their license!`,
+                      inline: false,
+                    },
+                  ]
+                : []),
             ])
             .setTimestamp();
 
-          // Create consistent action buttons for all statuses
-          const syncActionRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId(`foundry_status_${instance.userId}`)
-              .setLabel("Refresh Status")
-              .setStyle(ButtonStyle.Secondary)
-              .setEmoji("🔄")
-          );
+          // Create action buttons based on license type and status
+          let actionRow, destroyRow;
 
-          if (instance.status === "stopped" || instance.status === "created") {
-            syncActionRow.addComponents(
+          if (licenseType === "pooled") {
+            // Pooled instances get specialized buttons
+            actionRow = new ActionRowBuilder().addComponents(
               new ButtonBuilder()
-                .setCustomId(`foundry_start_${instance.userId}`)
-                .setLabel("Start Instance")
-                .setStyle(ButtonStyle.Success)
-                .setEmoji("🚀")
+                .setCustomId(`foundry_schedule_${instance.userId}`)
+                .setLabel("Schedule Session")
+                .setStyle(ButtonStyle.Primary)
+                .setEmoji("📅"),
+              new ButtonBuilder()
+                .setCustomId(`foundry_sessions_${instance.userId}`)
+                .setLabel("My Sessions")
+                .setStyle(ButtonStyle.Secondary)
+                .setEmoji("📋"),
+              new ButtonBuilder()
+                .setCustomId(`foundry_status_${instance.userId}`)
+                .setLabel("Check Status")
+                .setStyle(ButtonStyle.Secondary)
+                .setEmoji("🔄"),
+              new ButtonBuilder()
+                .setCustomId(`foundry_adminkey_${instance.userId}`)
+                .setLabel("Get Admin Key")
+                .setStyle(ButtonStyle.Secondary)
+                .setEmoji("🔑")
             );
-          }
 
-          // Add destroy button for stopped and created instances
-          if (instance.status === "stopped" || instance.status === "created") {
-            syncActionRow.addComponents(
+            destroyRow = new ActionRowBuilder().addComponents(
               new ButtonBuilder()
                 .setCustomId(`foundry_destroy_${instance.userId}`)
                 .setLabel("Destroy")
                 .setStyle(ButtonStyle.Danger)
                 .setEmoji("💀")
             );
-          }
+          } else {
+            // BYOL instances get different buttons based on status
+            actionRow = new ActionRowBuilder();
 
-          if (instance.status === "running") {
-            syncActionRow.addComponents(
-              new ButtonBuilder()
-                .setCustomId(`foundry_stop_${instance.userId}`)
-                .setLabel("Stop Instance")
-                .setStyle(ButtonStyle.Danger)
-                .setEmoji("⏹️")
-            );
+            if (
+              instance.status === "stopped" ||
+              instance.status === "created"
+            ) {
+              actionRow.addComponents(
+                new ButtonBuilder()
+                  .setCustomId(`foundry_start_${instance.userId}`)
+                  .setLabel("Start Instance")
+                  .setStyle(ButtonStyle.Success)
+                  .setEmoji("🚀"),
+                new ButtonBuilder()
+                  .setCustomId(`foundry_schedule_${instance.userId}`)
+                  .setLabel("Schedule Session")
+                  .setStyle(ButtonStyle.Primary)
+                  .setEmoji("📅"),
+                new ButtonBuilder()
+                  .setCustomId(`foundry_status_${instance.userId}`)
+                  .setLabel("Check Status")
+                  .setStyle(ButtonStyle.Secondary)
+                  .setEmoji("🔄"),
+                new ButtonBuilder()
+                  .setCustomId(`foundry_adminkey_${instance.userId}`)
+                  .setLabel("Get Admin Key")
+                  .setStyle(ButtonStyle.Secondary)
+                  .setEmoji("🔑")
+              );
+
+              destroyRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                  .setCustomId(`foundry_destroy_${instance.userId}`)
+                  .setLabel("Destroy")
+                  .setStyle(ButtonStyle.Danger)
+                  .setEmoji("💀")
+              );
+            } else if (instance.status === "running") {
+              actionRow.addComponents(
+                new ButtonBuilder()
+                  .setCustomId(`foundry_stop_${instance.userId}`)
+                  .setLabel("Stop Instance")
+                  .setStyle(ButtonStyle.Danger)
+                  .setEmoji("⏹️"),
+                new ButtonBuilder()
+                  .setCustomId(`foundry_status_${instance.userId}`)
+                  .setLabel("Refresh Status")
+                  .setStyle(ButtonStyle.Secondary)
+                  .setEmoji("🔄"),
+                new ButtonBuilder()
+                  .setCustomId(`foundry_adminkey_${instance.userId}`)
+                  .setLabel("Get Admin Key")
+                  .setStyle(ButtonStyle.Secondary)
+                  .setEmoji("🔑")
+              );
+
+              destroyRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                  .setCustomId(`foundry_destroy_${instance.userId}`)
+                  .setLabel("Destroy")
+                  .setStyle(ButtonStyle.Danger)
+                  .setEmoji("💀")
+              );
+            } else {
+              // Other statuses (starting, stopping, etc.)
+              actionRow.addComponents(
+                new ButtonBuilder()
+                  .setCustomId(`foundry_status_${instance.userId}`)
+                  .setLabel("Refresh Status")
+                  .setStyle(ButtonStyle.Secondary)
+                  .setEmoji("🔄")
+              );
+            }
           }
 
           await channel.send({
             embeds: [welcomeEmbed],
-            components: [syncActionRow],
+            components: destroyRow ? [actionRow, destroyRow] : [actionRow],
           });
 
           // Post current status with consistent controls
@@ -749,7 +997,8 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 async function handleSlashCommand(interaction) {
-  if (!hasRequiredRole(interaction.member)) {
+  // Skip role check for DMs (no guild member context)
+  if (interaction.guild && !hasRequiredRole(interaction.member)) {
     return await interaction.reply({
       content: "❌ You do not have permission to use Foundry commands.",
       ephemeral: true,
@@ -761,7 +1010,8 @@ async function handleSlashCommand(interaction) {
 
   try {
     interaction.invokeLambda = invokeLambda;
-    interaction.hasAdminRole = () => hasAdminRole(interaction.member);
+    interaction.hasAdminRole = () =>
+      interaction.guild ? hasAdminRole(interaction.member) : false;
     interaction.createUserCommandChannel = (userId, username) =>
       createUserCommandChannel(interaction.guild, userId, username);
     interaction.deleteUserCommandChannel = (userId) =>
@@ -821,11 +1071,7 @@ async function handleButtonInteraction(interaction) {
     }
   } else if (parts.length === 5) {
     // Format: foundry_action_part1_part2_userId (5-part special actions)
-    if (subAction === "create") {
-      // Format: foundry_create_pooled_own_userId
-      userId = parts[4];
-      confirmAction = `${subAction}_${parts[2]}_${parts[3]}`;
-    } else if (subAction === "destroy") {
+    if (subAction === "destroy") {
       // Format: foundry_destroy_keep_sharing_userId, foundry_destroy_stop_sharing_userId
       userId = parts[4];
       confirmAction = `${subAction}_${parts[2]}_${parts[3]}`;
@@ -851,8 +1097,12 @@ async function handleButtonInteraction(interaction) {
   }
 
   if (subAction === "schedule") {
-    // Check if user can interact with this button
-    if (userId !== interaction.user.id && !hasAdminRole(interaction.member)) {
+    // Check if user can interact with this button (skip admin check for DMs)
+    if (
+      userId !== interaction.user.id &&
+      interaction.guild &&
+      !hasAdminRole(interaction.member)
+    ) {
       return await interaction.reply({
         content: "❌ You can only control your own instance.",
         ephemeral: true,
@@ -900,25 +1150,12 @@ async function handleButtonInteraction(interaction) {
 
   if (confirmAction === "use_pooled") {
     try {
-      await handleUsePooledFromExisting(interaction, userId);
+      await handleCreatePooledAutomatic(interaction, userId);
       return;
     } catch (error) {
       console.error("Use pooled error:", error);
       return await interaction.reply({
         content: `❌ Failed to use pooled license: ${error.message}`,
-        ephemeral: true,
-      });
-    }
-  }
-
-  if (confirmAction === "create_pooled_own") {
-    try {
-      await handleCreatePooledOwnLicense(interaction, userId);
-      return;
-    } catch (error) {
-      console.error("Create pooled own license error:", error);
-      return await interaction.reply({
-        content: `❌ Failed to create pooled instance: ${error.message}`,
         ephemeral: true,
       });
     }
@@ -950,8 +1187,12 @@ async function handleButtonInteraction(interaction) {
     }
   }
 
-  // Check if user can interact with this button
-  if (userId !== interaction.user.id && !hasAdminRole(interaction.member)) {
+  // Check if user can interact with this button (skip admin check for DMs)
+  if (
+    userId !== interaction.user.id &&
+    interaction.guild &&
+    !hasAdminRole(interaction.member)
+  ) {
     return await interaction.reply({
       content: "❌ You can only control your own instance.",
       ephemeral: true,
@@ -1003,6 +1244,20 @@ async function handleButtonInteraction(interaction) {
 }
 
 async function handleRegisterButton(interaction, userId) {
+  // Prevent instance creation in DMs - must be done in server
+  if (!interaction.guild) {
+    return await interaction.reply({
+      content: [
+        "❌ **Instance creation must be done in the server**",
+        "",
+        "Please use the `/foundry dashboard` command in the server to register your instance.",
+        "",
+        "This ensures proper role verification and channel creation.",
+      ].join("\n"),
+      ephemeral: true,
+    });
+  }
+
   await interaction.deferReply({ ephemeral: true });
 
   // Check if user already has a license pool (destroyed instance but still sharing)
@@ -1048,7 +1303,7 @@ async function handleRegisterButton(interaction, userId) {
           {
             name: "Choose Action",
             value:
-              "• **Re-register Instance**: Create a new BYOL instance with full control\n• **Create Pooled Instance (My License)**: Use your own license in pooled mode (schedule-only)\n• **Stop License Sharing**: Remove your license from the pool and start fresh\n• **Use Pooled License**: Create an instance using someone else's shared license",
+              "• **Re-register Instance**: Create a new BYOL instance with full control\n• **Use Pooled License**: Create an instance with automatic license assignment (will prioritize your own license)\n• **Stop License Sharing**: Remove your license from the pool and start fresh",
             inline: false,
           },
         ]);
@@ -1060,20 +1315,15 @@ async function handleRegisterButton(interaction, userId) {
           .setStyle(ButtonStyle.Success)
           .setEmoji("🔄"),
         new ButtonBuilder()
-          .setCustomId(`foundry_create_pooled_own_${userId}`)
-          .setLabel("Create Pooled Instance (My License)")
+          .setCustomId(`foundry_use_pooled_${userId}`)
+          .setLabel("Use Pooled License")
           .setStyle(ButtonStyle.Primary)
-          .setEmoji("🔗"),
+          .setEmoji("🌐"),
         new ButtonBuilder()
           .setCustomId(`foundry_stop_sharing_${userId}`)
           .setLabel("Stop License Sharing")
           .setStyle(ButtonStyle.Secondary)
-          .setEmoji("🛑"),
-        new ButtonBuilder()
-          .setCustomId(`foundry_use_pooled_${userId}`)
-          .setLabel("Use Pooled License")
-          .setStyle(ButtonStyle.Primary)
-          .setEmoji("🌐")
+          .setEmoji("🛑")
       );
 
       return await interaction.editReply({
@@ -1110,11 +1360,11 @@ async function handleRegisterButton(interaction, userId) {
         inline: false,
       },
       {
-        name: "🌐 Pooled (Shared License)",
+        name: "🌐 Pooled (Smart License Assignment)",
         value:
           availablePools.length > 0
-            ? `• Use community shared licenses\n• Schedule sessions in advance\n• **${availablePools.length} license(s) available**`
-            : "• Use community shared licenses\n• Schedule sessions in advance\n• ⚠️ **No shared licenses currently available**",
+            ? `• Automatically assigns best available license\n• Schedule sessions in advance\n• **Prioritizes your own license if shared**\n• **${availablePools.length} license(s) available**`
+            : "• Automatically assigns best available license\n• Schedule sessions in advance\n• **Prioritizes your own license if shared**\n• ⚠️ **No shared licenses currently available**",
         inline: false,
       },
     ])
@@ -1138,8 +1388,8 @@ async function handleRegisterButton(interaction, userId) {
   // Only add pooled option if licenses are available
   if (availablePools.length > 0) {
     selectOptions.push({
-      label: "Pooled - Use Shared License",
-      description: `Use community licenses (${availablePools.length} available)`,
+      label: "Pooled - Smart License Assignment",
+      description: `Auto-assigns best license, prioritizes your own (${availablePools.length} available)`,
       value: "pooled",
       emoji: "🌐",
     });
@@ -1162,12 +1412,7 @@ async function handleAdminButtonInteraction(interaction) {
   const customId = interaction.customId;
 
   // Check admin permissions
-  const adminRoles = process.env.ADMIN_ROLES?.split(",") || [];
-  const isAdmin =
-    interaction.member.permissions.has(PermissionFlagsBits.Administrator) ||
-    adminRoles.some((role) =>
-      interaction.member.roles.cache.some((r) => r.name === role)
-    );
+  const isAdmin = hasAdminRole(interaction.member);
 
   if (!isAdmin) {
     await interaction.reply({
@@ -1536,6 +1781,20 @@ async function handleModalSubmit(interaction) {
 }
 
 async function handleCredentialsModal(interaction) {
+  // Prevent instance creation in DMs - must be done in server
+  if (!interaction.guild) {
+    return await interaction.reply({
+      content: [
+        "❌ **Instance creation must be done in the server**",
+        "",
+        "Please use the `/foundry dashboard` command in the server to register your instance.",
+        "",
+        "This ensures proper role verification and channel creation.",
+      ].join("\n"),
+      ephemeral: true,
+    });
+  }
+
   const modalIdParts = interaction.customId.split("_");
   const userId = modalIdParts[2];
   const licenseType = modalIdParts[3];
@@ -1885,7 +2144,30 @@ async function handleScheduleModal(interaction) {
       userId: userId,
     });
 
-    const licenseType = statusResult.licenseType || "byol";
+    // Determine license type carefully - don't assume BYOL for missing data
+    let licenseType = statusResult.licenseType;
+    let preferredLicenseId;
+
+    if (!licenseType) {
+      // Handle missing license type - check other indicators
+      if (
+        statusResult.licenseOwnerId &&
+        statusResult.licenseOwnerId !== `byol-${userId}`
+      ) {
+        // Has a license owner that's not themselves = pooled instance
+        licenseType = "pooled";
+        preferredLicenseId = undefined; // Let system auto-assign
+      } else {
+        // Default to BYOL for missing data
+        licenseType = "byol";
+        preferredLicenseId = `byol-${userId}`;
+      }
+    } else if (licenseType === "byol") {
+      preferredLicenseId = `byol-${userId}`;
+    } else {
+      // pooled or other
+      preferredLicenseId = undefined;
+    }
 
     // Schedule the session
     const result = await invokeLambda({
@@ -1896,7 +2178,7 @@ async function handleScheduleModal(interaction) {
       licenseType: licenseType,
       sessionTitle: title,
       sessionDescription: `Scheduled from ${timezoneStr} timezone`,
-      preferredLicenseId: licenseType === "byol" ? `byol-${userId}` : undefined,
+      preferredLicenseId: preferredLicenseId,
     });
 
     if (result.success) {
@@ -1919,7 +2201,8 @@ async function handleScheduleModal(interaction) {
           { name: "Duration", value: `${duration} hours`, inline: true },
           {
             name: "License Type",
-            value: licenseType.toUpperCase(),
+            value:
+              licenseType === "byol" ? "🔑 Your License" : "🌐 Pooled License",
             inline: true,
           },
           {
@@ -1930,12 +2213,6 @@ async function handleScheduleModal(interaction) {
             inline: false,
           },
           {
-            name: "License Type",
-            value:
-              licenseType === "byol" ? "🔑 Your License" : "🌐 Pooled License",
-            inline: true,
-          },
-          {
             name: "Session ID",
             value: `\`${result.sessionId}\``,
             inline: true,
@@ -1943,11 +2220,7 @@ async function handleScheduleModal(interaction) {
         ])
         .setTimestamp();
 
-      if (description) {
-        embed.addFields([
-          { name: "Description", value: description, inline: false },
-        ]);
-      }
+      // Description is included in sessionDescription parameter already
 
       if (result.conflictsResolved && result.conflictsResolved.length > 0) {
         embed.addFields([
@@ -2291,17 +2564,45 @@ async function handleDestroyConfirmButton(interaction, userId) {
     userId: userId,
   });
 
+  const instanceFound = result.instanceFound !== false;
+  const licensePoolDeactivated = result.licensePoolDeactivated || false;
+
   const embed = new EmbedBuilder()
     .setColor("#ff0000")
-    .setTitle("💀 Instance Destroyed")
-    .setDescription("Instance destroyed.")
+    .setTitle(
+      instanceFound
+        ? "💀 Instance Destroyed"
+        : licensePoolDeactivated
+        ? "✅ License Pool Deactivated"
+        : "ℹ️ No Instance Found"
+    )
+    .setDescription(
+      instanceFound
+        ? "Instance destroyed."
+        : licensePoolDeactivated
+        ? "No instance found, but your orphaned license pool has been deactivated."
+        : "No instance or license pool found to destroy."
+    )
     .addFields([
-      { name: "Status", value: "🗑️ Destroyed", inline: true },
       {
-        name: "Data",
-        value: "All data deleted",
+        name: "Status",
+        value: instanceFound ? "🗑️ Destroyed" : "❔ Not Found",
         inline: true,
       },
+      {
+        name: "Data",
+        value: instanceFound ? "All data deleted" : "No data found",
+        inline: true,
+      },
+      ...(licensePoolDeactivated && !instanceFound
+        ? [
+            {
+              name: "License Pool",
+              value: "🔴 Deactivated (was orphaned)",
+              inline: true,
+            },
+          ]
+        : []),
     ])
     .setTimestamp();
 
@@ -2318,8 +2619,8 @@ async function handleDestroyConfirmButton(interaction, userId) {
     components: [actionRow],
   });
 
-  // Clean up user channel
-  if (interaction.guild) {
+  // Clean up user channel (only if instance was actually destroyed)
+  if (interaction.guild && instanceFound) {
     await deleteUserCommandChannel(interaction.guild, userId);
   }
 }
@@ -2387,8 +2688,12 @@ async function handleSelectMenuInteraction(interaction) {
     return; // Unknown format
   }
 
-  // Check if user can interact with this menu
-  if (userId !== interaction.user.id && !hasAdminRole(interaction.member)) {
+  // Check if user can interact with this menu (skip admin check for DMs)
+  if (
+    userId !== interaction.user.id &&
+    interaction.guild &&
+    !hasAdminRole(interaction.member)
+  ) {
     return await interaction.reply({
       content: "❌ You can only control your own instance.",
       ephemeral: true,
@@ -2400,8 +2705,12 @@ async function handleSelectMenuInteraction(interaction) {
   } else if (menuType === "license") {
     await handleLicenseSelection(interaction, userId);
   } else if (menuType === "pooled_license") {
-    // Legacy handler - may still be used by existing interactions
-    await handlePooledLicenseSelection(interaction, userId);
+    // Legacy handler - redirect to automatic pooled creation
+    await interaction.reply({
+      content:
+        "❌ Manual license selection is no longer supported. Pooled instances now use automatic license assignment at session start.",
+      ephemeral: true,
+    });
   }
 }
 
@@ -2560,7 +2869,7 @@ async function handleLicenseSelection(interaction, userId) {
 
       // Update the interaction with success message
       await interaction.editReply({
-        content: `✅ **Pooled instance created**\n\nChannel: ${channel}\nLicense assignment: Automatic\nAdmin key sent to DMs`,
+        content: `✅ **Pooled instance created**\n\nChannel: ${channel}\nLicense assignment: Smart (prioritizes your own)\nAdmin key sent to DMs`,
       });
     } catch (error) {
       console.error("Error creating pooled instance:", error);
@@ -2605,16 +2914,30 @@ async function handleLicenseSelection(interaction, userId) {
 }
 
 async function handleReregisterBYOL(interaction, userId) {
+  // Prevent instance creation in DMs - must be done in server
+  if (!interaction.guild) {
+    return await interaction.reply({
+      content: [
+        "❌ **Instance creation must be done in the server**",
+        "",
+        "Please use the `/foundry dashboard` command in the server to register your instance.",
+        "",
+        "This ensures proper role verification and channel creation.",
+      ].join("\n"),
+      ephemeral: true,
+    });
+  }
+
   await interaction.deferUpdate();
 
   try {
-    // Re-register using existing credentials from license pool
+    // Re-register using existing credentials (preserved when license sharing was kept)
     const user = await client.users.fetch(userId);
     const sanitizedUsername = sanitizeUsername(user.username);
 
     await interaction.editReply({
       content:
-        "🔄 **Re-creating your BYOL instance...**\n\nUsing your existing credentials. Please wait...",
+        "🔄 **Re-creating your BYOL instance...**\n\nUsing your preserved credentials. Please wait...",
       components: [],
     });
 
@@ -2791,18 +3114,57 @@ async function handleStopSharing(interaction, userId) {
   }
 }
 
-async function handleCreatePooledOwnLicense(interaction, userId) {
+async function handleCreatePooledAutomatic(interaction, userId) {
+  // Prevent instance creation in DMs - must be done in server
+  if (!interaction.guild) {
+    return await interaction.reply({
+      content: [
+        "❌ **Instance creation must be done in the server**",
+        "",
+        "Please use the `/foundry dashboard` command in the server to register your instance.",
+        "",
+        "This ensures proper role verification and channel creation.",
+      ].join("\n"),
+      ephemeral: true,
+    });
+  }
+
   await interaction.deferUpdate();
 
   try {
-    // Create pooled instance using user's own license
+    // Check if any licenses are available
+    const poolsResult = await invokeLambda({
+      action: "admin-overview",
+      userId: userId,
+    });
+
+    const availablePools = poolsResult.licenses.pools.filter(
+      (pool) => pool.isActive
+    );
+
+    if (availablePools.length === 0) {
+      return await interaction.editReply({
+        content: [
+          "❌ **No shared licenses available**",
+          "",
+          "There are currently no active shared licenses in the community pool.",
+          "",
+          "**Options:**",
+          "• Use 'Re-register My Instance' to create a BYOL instance with full control",
+          "• Wait for others to share their licenses",
+          "• Use 'Stop License Sharing' to remove your license from the pool and register normally",
+        ].join("\n"),
+        components: [],
+      });
+    }
+
+    // Create pooled instance with automatic license assignment
     const user = await client.users.fetch(userId);
     const sanitizedUsername = sanitizeUsername(user.username);
-    const userLicenseId = `byol-${userId}`;
 
     await interaction.editReply({
       content:
-        "🔄 **Creating your pooled instance...**\n\nUsing your own license in pooled mode. Please wait...",
+        "🔄 **Creating your pooled instance...**\n\nLicense will be automatically assigned when you schedule sessions. Please wait...",
       components: [],
     });
 
@@ -2811,8 +3173,7 @@ async function handleCreatePooledOwnLicense(interaction, userId) {
       userId: userId,
       sanitizedUsername: sanitizedUsername,
       licenseType: "pooled",
-      selectedLicenseId: userLicenseId,
-      // No foundryUsername/foundryPassword - backend will use own credentials
+      // No selectedLicenseId - license will be assigned dynamically at session start
     });
 
     // Create user command channel
@@ -2824,18 +3185,18 @@ async function handleCreatePooledOwnLicense(interaction, userId) {
 
     const successEmbed = new EmbedBuilder()
       .setColor("#00ff00")
-      .setTitle("✅ Pooled Instance Created (Your License)")
+      .setTitle("✅ Pooled Instance Created")
       .setDescription(`Command channel: ${channel}`)
       .addFields([
         { name: "Status", value: "⚪ Created", inline: true },
         {
           name: "License Type",
-          value: "🔗 Pooled - Using Your Own License",
+          value: "🌐 Pooled - Smart License Assignment",
           inline: true,
         },
         {
-          name: "License Owner",
-          value: "You (in pooled mode)",
+          name: "License Assignment",
+          value: `Automatic - prioritizes your own license (${availablePools.length} license(s) available)`,
           inline: true,
         },
         {
@@ -2850,13 +3211,14 @@ async function handleCreatePooledOwnLicense(interaction, userId) {
         },
         {
           name: "Access Rules",
-          value: "⚠️ Schedule-only access (same rules as other pooled users)",
+          value:
+            "⚠️ Schedule-only access - optimal license assigned automatically",
           inline: true,
         },
         {
           name: "Next Step",
           value:
-            'Use "Schedule Session" to book time (pooled mode = schedule-only access, same rules as other users of your license)',
+            'Use "Schedule Session" to book time (system will automatically assign the best available license, starting with your own if shared)',
           inline: false,
         },
       ]);
@@ -2918,17 +3280,17 @@ async function handleCreatePooledOwnLicense(interaction, userId) {
     });
 
     await channel.send({
-      content: `<@${userId}> Pooled instance created using your own license.`,
+      content: `<@${userId}> Pooled instance created with automatic license assignment.`,
       embeds: [successEmbed],
       components: [actionRow, destroyRow],
     });
 
     // Update the interaction with success message
     await interaction.editReply({
-      content: `✅ **Pooled instance created**\n\nChannel: ${channel}\nUsing: Your own license (pooled mode)\nAdmin key sent to DMs`,
+      content: `✅ **Pooled instance created**\n\nChannel: ${channel}\nLicense assignment: Smart (prioritizes your own)\nAdmin key sent to DMs`,
     });
   } catch (error) {
-    console.error("Error creating pooled instance with own license:", error);
+    console.error("Error creating automatic pooled instance:", error);
     await interaction.editReply({
       content: `❌ **Failed to create pooled instance**\n\n**Error:** ${error.message}\n\nPlease try again or contact an admin if the problem persists.`,
       components: [],
@@ -2953,16 +3315,34 @@ async function handleDestroyKeepSharing(interaction, userId) {
 
     console.log(`Destroy with keep sharing result:`, result);
 
+    const instanceFound = result.instanceFound !== false;
+
     const embed = new EmbedBuilder()
       .setColor("#ff9900")
-      .setTitle("✅ Instance Destroyed - License Sharing Kept Active")
+      .setTitle(
+        instanceFound
+          ? "✅ Instance Destroyed - License Sharing Kept Active"
+          : "✅ License Sharing Kept Active"
+      )
       .setDescription(
-        "Your instance has been destroyed but your license remains shared with the community."
+        instanceFound
+          ? "Your instance has been destroyed but your license remains shared with the community."
+          : "No instance was found to destroy, but your license remains shared with the community."
       )
       .addFields([
-        { name: "Instance Status", value: "🗑️ Destroyed", inline: true },
+        {
+          name: "Instance Status",
+          value: instanceFound ? "🗑️ Destroyed" : "❔ Already Gone",
+          inline: true,
+        },
         { name: "License Sharing", value: "🟢 Still Active", inline: true },
-        { name: "Data", value: "All instance data deleted", inline: true },
+        {
+          name: "Data",
+          value: instanceFound
+            ? "All instance data deleted"
+            : "No instance data found",
+          inline: true,
+        },
         {
           name: "What's Next?",
           value:
@@ -2985,10 +3365,11 @@ async function handleDestroyKeepSharing(interaction, userId) {
       components: [actionRow],
     });
 
-    // Clean up user channel
+    // Clean up user channel (get guild from client since DM interactions don't have guild)
     try {
-      if (interaction.guild) {
-        await deleteUserCommandChannel(interaction.guild, userId);
+      const guild = interaction.guild || client.guilds.cache.first();
+      if (guild) {
+        await deleteUserCommandChannel(guild, userId);
       }
     } catch (channelError) {
       console.log("Channel cleanup failed (non-critical):", channelError);
@@ -3010,34 +3391,58 @@ async function handleDestroyStopSharing(interaction, userId) {
       `Stopping license sharing and destroying instance for user ${userId}`
     );
 
-    // First stop license sharing, then destroy instance
-    await invokeLambda({
+    // First stop license sharing
+    const sharingResult = await invokeLambda({
       action: "set-license-sharing",
       userId: userId,
       licenseType: "byol",
       allowLicenseSharing: false,
     });
 
-    console.log(`License sharing stopped for user ${userId}`);
+    console.log(`License sharing result:`, sharingResult);
 
-    // Then destroy the instance
-    const result = await invokeLambda({
-      action: "destroy",
-      userId: userId,
-    });
-
-    console.log(`Destroy result:`, result);
+    // Then destroy the instance if it exists
+    let destroyResult = null;
+    if (sharingResult.instanceFound) {
+      destroyResult = await invokeLambda({
+        action: "destroy",
+        userId: userId,
+      });
+      console.log(`Destroy result:`, destroyResult);
+    } else {
+      console.log(
+        `No instance to destroy for user ${userId}, only stopped license sharing`
+      );
+    }
 
     const embed = new EmbedBuilder()
       .setColor("#ff0000")
-      .setTitle("✅ License Sharing Stopped & Instance Destroyed")
+      .setTitle(
+        sharingResult.instanceFound
+          ? "✅ License Sharing Stopped & Instance Destroyed"
+          : "✅ License Sharing Stopped"
+      )
       .setDescription(
-        "Your license has been removed from the community pool and your instance has been destroyed."
+        sharingResult.instanceFound
+          ? "Your license has been removed from the community pool and your instance has been destroyed."
+          : "Your license has been removed from the community pool. No instance was found to destroy."
       )
       .addFields([
-        { name: "Instance Status", value: "🗑️ Destroyed", inline: true },
+        {
+          name: "Instance Status",
+          value: sharingResult.instanceFound
+            ? "🗑️ Destroyed"
+            : "❔ Already Gone",
+          inline: true,
+        },
         { name: "License Sharing", value: "🔴 Stopped", inline: true },
-        { name: "Data", value: "All instance data deleted", inline: true },
+        {
+          name: "Data",
+          value: sharingResult.instanceFound
+            ? "All instance data deleted"
+            : "No instance data found",
+          inline: true,
+        },
         {
           name: "What's Next?",
           value:
@@ -3060,10 +3465,11 @@ async function handleDestroyStopSharing(interaction, userId) {
       components: [actionRow],
     });
 
-    // Clean up user channel
+    // Clean up user channel (get guild from client since DM interactions don't have guild)
     try {
-      if (interaction.guild) {
-        await deleteUserCommandChannel(interaction.guild, userId);
+      const guild = interaction.guild || client.guilds.cache.first();
+      if (guild) {
+        await deleteUserCommandChannel(guild, userId);
       }
     } catch (channelError) {
       console.log("Channel cleanup failed (non-critical):", channelError);
@@ -3077,6 +3483,7 @@ async function handleDestroyStopSharing(interaction, userId) {
   }
 }
 
+// DEPRECATED: Manual license selection removed - pooled instances now use automatic assignment
 async function handleUsePooledFromExisting(interaction, userId) {
   // Show available pooled licenses (excluding user's own if they have one)
   await interaction.deferUpdate();
@@ -3161,6 +3568,7 @@ async function handleUsePooledFromExisting(interaction, userId) {
   }
 }
 
+// DEPRECATED: Manual license selection removed - pooled instances now use automatic assignment
 async function handlePooledLicenseSelection(interaction, userId) {
   const selectedLicenseId = interaction.values[0];
 
@@ -3496,8 +3904,8 @@ async function handleScheduleButton(interaction, userId) {
 
   const startTimeInput = new TextInputBuilder()
     .setCustomId("start_time")
-    .setLabel("Start Time - YOUR LOCAL TIME (YYYY-MM-DD HH:MM)")
-    .setPlaceholder("e.g., '2024-01-15 19:00' (YOUR timezone, 24-hour format)")
+    .setLabel("Start Time (YOUR Local Time)")
+    .setPlaceholder("YYYY-MM-DD HH:MM (e.g., '2024-01-15 19:00')")
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
     .setMaxLength(20);
@@ -3505,7 +3913,7 @@ async function handleScheduleButton(interaction, userId) {
   const timezoneInput = new TextInputBuilder()
     .setCustomId("timezone")
     .setLabel("Your Timezone")
-    .setPlaceholder("EST, PST, UTC-5, GMT+1, America/New_York, Europe/London")
+    .setPlaceholder("EST, PST, UTC-5, GMT+1, America/New_York, etc.")
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
     .setMaxLength(50);
@@ -3575,7 +3983,15 @@ async function handleSessionsButton(interaction, userId) {
       })
       .join("\n");
 
-    embed.setDescription(sessionsText);
+    // Discord embed description limit is 4096 characters
+    if (sessionsText.length > 4000) {
+      embed.setDescription(
+        sessionsText.substring(0, 3950) +
+          "\n\n... (list truncated, showing latest sessions)"
+      );
+    } else {
+      embed.setDescription(sessionsText);
+    }
 
     // Add action buttons for session management
     const actionRow = new ActionRowBuilder().addComponents(

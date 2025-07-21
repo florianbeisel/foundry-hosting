@@ -75,14 +75,80 @@ async function handleDashboard(interaction, userId) {
       unknown: "❔",
     };
 
-    // Determine license display text
-    const licenseType = result.licenseType || "byol";
-    const licenseDisplay =
-      licenseType === "byol"
-        ? `🔑 BYOL (Own License)${
-            result.allowLicenseSharing ? " - Shared" : ""
-          }`
-        : "🌐 Pooled (Shared License)";
+    // Determine license display text and get license owner info - handle missing data carefully
+    let licenseDisplay;
+    let licenseOwnerInfo = null;
+    const licenseType = result.licenseType;
+
+    if (!licenseType) {
+      // Handle missing license type - check other indicators
+      if (
+        result.licenseOwnerId &&
+        result.licenseOwnerId !== `byol-${result.userId}`
+      ) {
+        // Has a license owner that's not themselves = pooled instance
+        licenseDisplay = "🌐 Pooled (Shared License)";
+        // Try to get owner info
+        try {
+          const adminResult = await interaction.invokeLambda({
+            action: "admin-overview",
+            userId: result.userId,
+          });
+          if (adminResult.licenses && adminResult.licenses.pools) {
+            const licensePool = adminResult.licenses.pools.find(
+              (pool) => pool.licenseId === result.licenseOwnerId
+            );
+            if (licensePool) {
+              licenseOwnerInfo = licensePool.ownerUsername;
+              licenseDisplay = `🌐 Pooled (${licenseOwnerInfo}'s License)`;
+            }
+          }
+        } catch (error) {
+          console.log("Could not fetch license owner info for dashboard");
+        }
+      } else {
+        // Default to BYOL for missing data
+        licenseDisplay = `🔑 BYOL (Own License)${
+          result.allowLicenseSharing ? " - Shared" : ""
+        }`;
+      }
+    } else if (licenseType === "byol") {
+      licenseDisplay = `🔑 BYOL (Own License)${
+        result.allowLicenseSharing ? " - Shared" : ""
+      }`;
+    } else if (licenseType === "pooled") {
+      // Get license owner info for pooled instances
+      if (result.licenseOwnerId) {
+        try {
+          const adminResult = await interaction.invokeLambda({
+            action: "admin-overview",
+            userId: result.userId,
+          });
+
+          if (adminResult.licenses && adminResult.licenses.pools) {
+            const licensePool = adminResult.licenses.pools.find(
+              (pool) => pool.licenseId === result.licenseOwnerId
+            );
+            if (licensePool) {
+              licenseOwnerInfo = licensePool.ownerUsername;
+              licenseDisplay = `🌐 Pooled (${licenseOwnerInfo}'s License)`;
+            } else {
+              licenseDisplay = "🌐 Pooled (Shared License)";
+            }
+          } else {
+            licenseDisplay = "🌐 Pooled (Shared License)";
+          }
+        } catch (error) {
+          console.log("Could not fetch license owner info for dashboard");
+          licenseDisplay = "🌐 Pooled (Shared License)";
+        }
+      } else {
+        licenseDisplay = "🌐 Pooled (Automatic Assignment)";
+      }
+    } else {
+      // Unknown license type
+      licenseDisplay = `❔ Unknown License Type: ${licenseType}`;
+    }
 
     const embed = new EmbedBuilder()
       .setColor(result.status === "running" ? "#00ff00" : "#888888")
@@ -102,6 +168,15 @@ async function handleDashboard(interaction, userId) {
           value: licenseDisplay,
           inline: true,
         },
+        ...(licenseOwnerInfo
+          ? [
+              {
+                name: "🤝 Thanks to",
+                value: `**${licenseOwnerInfo}** for sharing their license with the community!`,
+                inline: false,
+              },
+            ]
+          : []),
       ])
       .setTimestamp();
 

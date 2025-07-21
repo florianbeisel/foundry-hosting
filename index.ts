@@ -627,8 +627,11 @@ new aws.iam.RolePolicy(`${projectName}-lambda-permissions`, {
               "s3:PutBucketVersioning",
               "s3:PutBucketOwnershipControls",
               "s3:ListBucket",
+              "s3:ListBucketVersions",
               "s3:DeleteObject",
+              "s3:DeleteObjectVersion",
               "s3:ListObjectsV2",
+              "s3:GetBucketVersioning",
               // IAM permissions for per-instance users
               "iam:CreateUser",
               "iam:DeleteUser",
@@ -696,7 +699,7 @@ const instanceManagementLambda = new aws.lambda.Function(
 // CloudWatch Log Group for ECS tasks
 const logGroup = new aws.cloudwatch.LogGroup(`${projectName}-ecs-logs`, {
   name: `/aws/ecs/${projectName}`,
-  retentionInDays: 7,
+  retentionInDays: 3, // Reduced from 7 days to minimize storage costs
   tags: {
     Name: `${projectName}-ecs-logs`,
     Environment: environment,
@@ -789,8 +792,8 @@ const discordBotTaskDefinition = new aws.ecs.TaskDefinition(
     family: `${projectName}-discord-bot`,
     networkMode: "awsvpc",
     requiresCompatibilities: ["FARGATE"],
-    cpu: "256", // Minimal CPU for Discord bot
-    memory: "512", // Minimal memory
+    cpu: "256", // MINIMUM for Fargate ARM64 - cannot be reduced further
+    memory: "512", // MINIMUM for 256 CPU - cannot be reduced further
     executionRoleArn: executionRole.arn,
     taskRoleArn: taskRole.arn, // Same role as Foundry instances - can invoke Lambda
     runtimePlatform: {
@@ -863,9 +866,9 @@ const discordBotTaskDefinition = new aws.ecs.TaskDefinition(
                 "CMD-SHELL",
                 "node -e \"console.log('healthy')\" || exit 1",
               ],
-              interval: 30,
-              timeout: 5,
-              retries: 3,
+              interval: 120, // Increased from 30s to 2min to reduce CPU overhead
+              timeout: 10, // Slightly increased timeout
+              retries: 2, // Reduced retries from 3 to 2
               startPeriod: 60,
             },
           },
@@ -887,8 +890,8 @@ const discordBotService = new aws.ecs.Service(
     name: `${projectName}-discord-bot`,
     cluster: cluster.arn,
     taskDefinition: discordBotTaskDefinition.arn,
-    launchType: "FARGATE",
-    desiredCount: 1,
+    launchType: "FARGATE", // Could consider FARGATE_SPOT for ~70% cost savings, but impacts availability
+    desiredCount: 1, // Minimum for high availability
     networkConfiguration: {
       subnets: vpc.privateSubnetIds,
       securityGroups: [taskSecurityGroup.id], // Same security group as Foundry instances
@@ -913,7 +916,7 @@ const discordBotLogGroup = new aws.cloudwatch.LogGroup(
   `${projectName}-discord-bot-logs`,
   {
     name: `/aws/ecs/${projectName}-discord-bot`,
-    retentionInDays: 7,
+    retentionInDays: 1, // Minimal retention for Discord bot logs to reduce costs
     tags: {
       Name: `${projectName}-discord-bot-logs`,
       Environment: environment,

@@ -19,13 +19,34 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   async execute(interaction) {
-    // Check admin permissions
-    const adminRoles = process.env.ADMIN_ROLES?.split(",") || [];
-    const isAdmin =
-      interaction.member.permissions.has(PermissionFlagsBits.Administrator) ||
-      adminRoles.some((role) =>
-        interaction.member.roles.cache.some((r) => r.name === role)
+    // Check admin permissions - admin commands only work in guilds, not DMs
+    if (!interaction.guild || !interaction.member) {
+      return interaction.reply({
+        content:
+          "❌ Admin commands can only be used in server channels, not DMs.",
+        ephemeral: true,
+      });
+    }
+
+    // Safe admin role check
+    const hasAdminRole = (member) => {
+      if (!member || !member.roles || !member.permissions) return false;
+
+      // Check Discord's built-in Administrator permission first
+      if (member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return true;
+      }
+
+      // Then check custom admin roles
+      const adminRoles = process.env.ADMIN_ROLES?.split(",") || ["Admin"];
+      return adminRoles.some((role) =>
+        member.roles.cache.some(
+          (memberRole) => memberRole.name.toLowerCase() === role.toLowerCase()
+        )
       );
+    };
+
+    const isAdmin = hasAdminRole(interaction.member);
 
     if (!isAdmin) {
       return interaction.reply({

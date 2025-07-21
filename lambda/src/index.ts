@@ -197,6 +197,15 @@ export const handler = async (
 };
 
 async function createInstance(userId: string, event: FoundryEvent) {
+  // Debug logging for pooled instance creation
+  console.log(`🔍 CreateInstance Debug for ${userId}:`, {
+    receivedLicenseType: event.licenseType,
+    receivedAllowLicenseSharing: event.allowLicenseSharing,
+    receivedMaxConcurrentUsers: event.maxConcurrentUsers,
+    receivedSelectedLicenseId: event.selectedLicenseId,
+    fullEvent: event,
+  });
+
   // Check if user already has an instance
   const existing = await dynamoManager.getInstance(userId);
   if (existing) {
@@ -368,6 +377,31 @@ async function createInstance(userId: string, event: FoundryEvent) {
   // Get next available ALB rule priority
   const priority = await albManager.getNextAvailablePriority();
 
+  // Set proper defaults for pooled vs BYOL instances
+  let finalLicenseOwnerId: string | undefined;
+  let finalAllowLicenseSharing: boolean | undefined;
+  let finalMaxConcurrentUsers: number;
+
+  if (validatedLicenseType === "pooled") {
+    // For pooled instances with dynamic assignment, licenseOwnerId will be set when session starts
+    finalLicenseOwnerId = selectedLicenseId || undefined; // Will be set dynamically later
+    finalAllowLicenseSharing = false; // Pooled users don't share licenses themselves
+    finalMaxConcurrentUsers = 1; // Default for pooled users
+  } else {
+    // For BYOL instances
+    finalLicenseOwnerId = undefined; // BYOL users don't use others' licenses
+    finalAllowLicenseSharing = allowLicenseSharing;
+    finalMaxConcurrentUsers = maxConcurrentUsers || 1;
+  }
+
+  // Debug logging before DynamoDB call
+  console.log(`🔍 Creating DynamoDB record with license data:`, {
+    validatedLicenseType,
+    finalAllowLicenseSharing,
+    finalMaxConcurrentUsers,
+    finalLicenseOwnerId,
+  });
+
   // Create instance record with ALB and S3 info
   const instance = await dynamoManager.createInstance({
     userId,
@@ -383,12 +417,19 @@ async function createInstance(userId: string, event: FoundryEvent) {
     targetGroupArn,
     albRulePriority: priority,
     licenseType: validatedLicenseType,
-    allowLicenseSharing: allowLicenseSharing,
-    maxConcurrentUsers: maxConcurrentUsers || 1,
-    licenseOwnerId:
-      validatedLicenseType === "pooled" ? selectedLicenseId : undefined,
+    allowLicenseSharing: finalAllowLicenseSharing,
+    maxConcurrentUsers: finalMaxConcurrentUsers,
+    licenseOwnerId: finalLicenseOwnerId,
     createdAt: Math.floor(Date.now() / 1000),
     updatedAt: Math.floor(Date.now() / 1000),
+  });
+
+  // Debug logging after DynamoDB call
+  console.log(`✅ Created instance with license fields:`, {
+    instanceLicenseType: instance.licenseType,
+    instanceAllowLicenseSharing: instance.allowLicenseSharing,
+    instanceMaxConcurrentUsers: instance.maxConcurrentUsers,
+    instanceLicenseOwnerId: instance.licenseOwnerId,
   });
 
   // If user is sharing their license, add to license pool or reactivate existing one
@@ -578,9 +619,111 @@ async function stopInstance(userId: string) {
 }
 
 async function destroyInstance(userId: string, event?: FoundryEvent) {
+  const now = Math.floor(Date.now() / 1000);
+
+  // Cancel all user's scheduled and active sessions first
+  let cancelledSessionsCount = 0;
+  try {
+    const userSessions = await dynamoManager.getUserScheduledSessions(userId);
+    const sessionsToCancel = userSessions.filter(
+      (s) => s.status === "scheduled" || s.status === "active"
+    );
+
+    for (const session of sessionsToCancel) {
+      try {
+        await dynamoManager.updateScheduledSession(session.sessionId, {
+          status: "cancelled",
+          updatedAt: now,
+        });
+
+        // Clean up license reservations
+        if (session.licenseId) {
+          try {
+            const reservations = await dynamoManager.getLicenseReservations(
+              session.licenseId,
+              session.startTime,
+              session.endTime
+            );
+
+            for (const reservation of reservations) {
+              if (reservation.sessionId === session.sessionId) {
+                await dynamoManager.updateLicenseReservation(
+                  reservation.reservationId,
+                  { status: "cancelled" }
+                );
+                console.log(
+                  `Cancelled license reservation ${reservation.reservationId} for destroy-cancelled session ${session.sessionId}`
+                );
+              }
+            }
+          } catch (reservationError) {
+            console.error(
+              `Failed to clean up license reservations for session ${session.sessionId}:`,
+              reservationError
+            );
+          }
+        }
+
+        cancelledSessionsCount++;
+        console.log(
+          `Cancelled session ${session.sessionId} for destroyed instance`
+        );
+      } catch (sessionError) {
+        console.error(
+          `Failed to cancel session ${session.sessionId}:`,
+          sessionError
+        );
+      }
+    }
+  } catch (error) {
+    console.error(`Failed to retrieve user sessions for ${userId}:`, error);
+  }
+
   const instance = await dynamoManager.getInstance(userId);
   if (!instance) {
-    throw new Error("Instance not found");
+    console.log(
+      `Instance not found for user ${userId}, checking for orphaned license pool only`
+    );
+
+    // Handle orphaned license pools (pools without instances)
+    if (!event?.keepLicenseSharing) {
+      const licenseId = `byol-${userId}`;
+      try {
+        const existingPool = await dynamoManager.getLicensePool(licenseId);
+        if (existingPool && existingPool.isActive) {
+          await dynamoManager.updateLicensePool(licenseId, {
+            isActive: false,
+            updatedAt: now,
+          });
+          console.log(`Deactivated orphaned license pool: ${licenseId}`);
+
+          return {
+            message:
+              cancelledSessionsCount > 0
+                ? `No instance found, but orphaned license pool has been deactivated and ${cancelledSessionsCount} sessions cancelled`
+                : "No instance found, but orphaned license pool has been deactivated",
+            userId,
+            licensePoolDeactivated: true,
+            cancelledSessionsCount,
+          };
+        }
+      } catch (poolError) {
+        console.error(
+          `Failed to check/deactivate license pool ${licenseId}:`,
+          poolError
+        );
+      }
+    }
+
+    return {
+      message:
+        cancelledSessionsCount > 0
+          ? `No instance found to destroy, but ${cancelledSessionsCount} sessions cancelled`
+          : "No instance found to destroy",
+      userId,
+      instanceFound: false,
+      cancelledSessionsCount,
+    };
   }
 
   // Stop task and clean up ALB first
@@ -619,9 +762,16 @@ async function destroyInstance(userId: string, event?: FoundryEvent) {
     await iamManager.deleteFoundryUser(userId, instance.sanitizedUsername);
   }
 
-  // Delete secrets
-  if (instance.secretArn) {
+  // Conditionally delete secrets - preserve if keeping license sharing
+  if (instance.secretArn && !event?.keepLicenseSharing) {
     await secretsManager.deleteSecret(instance.secretArn);
+    console.log(
+      `Deleted credentials for user ${userId} (not keeping license sharing)`
+    );
+  } else if (instance.secretArn && event?.keepLicenseSharing) {
+    console.log(
+      `Preserved credentials for user ${userId} (keeping license sharing active)`
+    );
   }
 
   // Conditionally deactivate license pools based on user choice
@@ -649,8 +799,12 @@ async function destroyInstance(userId: string, event?: FoundryEvent) {
   await dynamoManager.deleteInstance(userId);
 
   return {
-    message: "Instance destroyed successfully",
+    message:
+      cancelledSessionsCount > 0
+        ? `Instance destroyed successfully (${cancelledSessionsCount} sessions cancelled)`
+        : "Instance destroyed successfully",
     userId,
+    cancelledSessionsCount,
   };
 }
 
@@ -753,6 +907,7 @@ async function getInstanceStatus(userId: string) {
       ? s3Manager.getBucketUrl(instance.s3BucketName)
       : undefined,
     licenseType: instance.licenseType,
+    licenseOwnerId: instance.licenseOwnerId,
     allowLicenseSharing: instance.allowLicenseSharing,
     autoShutdownAt: instance.autoShutdownAt,
     linkedSessionId: instance.linkedSessionId,
@@ -777,6 +932,11 @@ async function getAllInstances() {
       s3BucketUrl: instance.s3BucketName
         ? s3Manager.getBucketUrl(instance.s3BucketName)
         : undefined,
+      // Include license fields for Discord bot license detection
+      licenseType: instance.licenseType,
+      licenseOwnerId: instance.licenseOwnerId,
+      allowLicenseSharing: instance.allowLicenseSharing,
+      maxConcurrentUsers: instance.maxConcurrentUsers,
     })),
     count: instances.length,
   };
@@ -873,10 +1033,41 @@ async function cancelSession(sessionId: string) {
     throw new Error("Session not found");
   }
 
+  const now = Math.floor(Date.now() / 1000);
+
+  // Cancel the session
   await dynamoManager.updateScheduledSession(sessionId, {
     status: "cancelled",
-    updatedAt: Math.floor(Date.now() / 1000),
+    updatedAt: now,
   });
+
+  // Clean up license reservations
+  if (session.licenseId) {
+    try {
+      const reservations = await dynamoManager.getLicenseReservations(
+        session.licenseId,
+        session.startTime,
+        session.endTime
+      );
+
+      for (const reservation of reservations) {
+        if (reservation.sessionId === sessionId) {
+          await dynamoManager.updateLicenseReservation(
+            reservation.reservationId,
+            { status: "cancelled" }
+          );
+          console.log(
+            `Cancelled license reservation ${reservation.reservationId} for session ${sessionId}`
+          );
+        }
+      }
+    } catch (error) {
+      console.error(
+        `Failed to clean up license reservations for session ${sessionId}:`,
+        error
+      );
+    }
+  }
 
   return {
     message: "Session cancelled successfully",
@@ -894,21 +1085,25 @@ async function listUserSessions(userId: string) {
 
 async function setLicenseSharing(userId: string, event: FoundryEvent) {
   const instance = await dynamoManager.getInstance(userId);
-  if (!instance) {
-    throw new Error("Instance not found");
-  }
 
   // Default to BYOL if not specified
   const licenseType = event.licenseType || "byol";
 
-  await dynamoManager.updateInstance(userId, {
-    licenseType,
-    allowLicenseSharing: event.allowLicenseSharing,
-    maxConcurrentUsers: event.maxConcurrentUsers,
-    updatedAt: Math.floor(Date.now() / 1000),
-  });
+  // If instance exists, update its settings
+  if (instance) {
+    await dynamoManager.updateInstance(userId, {
+      licenseType,
+      allowLicenseSharing: event.allowLicenseSharing,
+      maxConcurrentUsers: event.maxConcurrentUsers,
+      updatedAt: Math.floor(Date.now() / 1000),
+    });
+  } else {
+    console.log(
+      `Instance not found for user ${userId}, only managing license pool`
+    );
+  }
 
-  // If user is sharing their license, add to license pool or reactivate existing one
+  // Manage license pool regardless of instance existence
   if (licenseType === "byol" && event.allowLicenseSharing) {
     const licenseId = `byol-${userId}`;
 
@@ -917,15 +1112,17 @@ async function setLicenseSharing(userId: string, event: FoundryEvent) {
 
     if (existingPool) {
       // Reactivate or update existing pool
+      const ownerUsername =
+        instance?.sanitizedUsername || existingPool.ownerUsername;
       await dynamoManager.updateLicensePool(licenseId, {
-        ownerUsername: instance.sanitizedUsername,
+        ownerUsername,
         maxConcurrentUsers: event.maxConcurrentUsers || 1,
         isActive: true,
         updatedAt: Math.floor(Date.now() / 1000),
       });
       console.log(`Reactivated existing license pool: ${licenseId}`);
-    } else {
-      // Create new license pool
+    } else if (instance) {
+      // Only create new pool if instance exists (we need username)
       await dynamoManager.createLicensePool({
         licenseId,
         ownerId: userId,
@@ -936,6 +1133,10 @@ async function setLicenseSharing(userId: string, event: FoundryEvent) {
         updatedAt: Math.floor(Date.now() / 1000),
       });
       console.log(`Created new license pool: ${licenseId}`);
+    } else {
+      console.log(
+        `Cannot create license pool without instance for user ${userId}`
+      );
     }
   } else if (licenseType === "byol" && !event.allowLicenseSharing) {
     // If user is turning off license sharing, deactivate their pool
@@ -955,10 +1156,13 @@ async function setLicenseSharing(userId: string, event: FoundryEvent) {
   }
 
   return {
-    message: "License sharing settings updated",
+    message: instance
+      ? "License sharing settings updated"
+      : "License pool updated (no instance found)",
     licenseType,
     allowLicenseSharing: event.allowLicenseSharing,
     maxConcurrentUsers: event.maxConcurrentUsers,
+    instanceFound: !!instance,
   };
 }
 
@@ -971,7 +1175,8 @@ async function checkLicenseAvailability(event: FoundryEvent) {
     event.licenseType,
     event.startTime,
     event.endTime,
-    event.preferredLicenseId
+    event.preferredLicenseId,
+    event.userId // Pass user ID for smart license prioritization
   );
 
   return {
@@ -1207,10 +1412,39 @@ async function adminCancelSession(sessionId: string, reason?: string) {
   }
 
   // Cancel the session
+  const now = Math.floor(Date.now() / 1000);
   await dynamoManager.updateScheduledSession(sessionId, {
     status: "cancelled",
-    updatedAt: Math.floor(Date.now() / 1000),
+    updatedAt: now,
   });
+
+  // Clean up license reservations
+  if (session.licenseId) {
+    try {
+      const reservations = await dynamoManager.getLicenseReservations(
+        session.licenseId,
+        session.startTime,
+        session.endTime
+      );
+
+      for (const reservation of reservations) {
+        if (reservation.sessionId === sessionId) {
+          await dynamoManager.updateLicenseReservation(
+            reservation.reservationId,
+            { status: "cancelled" }
+          );
+          console.log(
+            `Cancelled license reservation ${reservation.reservationId} for admin-cancelled session ${sessionId}`
+          );
+        }
+      }
+    } catch (error) {
+      console.error(
+        `Failed to clean up license reservations for admin-cancelled session ${sessionId}:`,
+        error
+      );
+    }
+  }
 
   // Log the admin action
   const logMessage = `Admin cancel session - Session: ${sessionId}, User: ${
@@ -1233,11 +1467,11 @@ async function adminCancelAllSessions(reason?: string) {
     `Admin cancel all sessions, reason: ${reason || "No reason provided"}`
   );
 
-  // Get all active and scheduled sessions
+  // Get all active and scheduled sessions (expanded time range to catch all sessions)
   const now = Math.floor(Date.now() / 1000);
   const allSessions = await dynamoManager.getSessionsInTimeRange(
-    now - 24 * 60 * 60, // Last 24 hours for active sessions
-    now + 7 * 24 * 60 * 60 // Next 7 days for scheduled sessions
+    now - 30 * 24 * 60 * 60, // Last 30 days for any lingering active sessions
+    now + 365 * 24 * 60 * 60 // Next 365 days for all scheduled sessions
   );
 
   const sessionsToCancel = allSessions.filter(
@@ -1278,6 +1512,34 @@ async function adminCancelAllSessions(reason?: string) {
         updatedAt: now,
       });
 
+      // Clean up license reservations
+      if (session.licenseId) {
+        try {
+          const reservations = await dynamoManager.getLicenseReservations(
+            session.licenseId,
+            session.startTime,
+            session.endTime
+          );
+
+          for (const reservation of reservations) {
+            if (reservation.sessionId === session.sessionId) {
+              await dynamoManager.updateLicenseReservation(
+                reservation.reservationId,
+                { status: "cancelled" }
+              );
+              console.log(
+                `Cancelled license reservation ${reservation.reservationId} for bulk-cancelled session ${session.sessionId}`
+              );
+            }
+          }
+        } catch (reservationError) {
+          console.error(
+            `Failed to clean up license reservations for session ${session.sessionId}:`,
+            reservationError
+          );
+        }
+      }
+
       cancelledCount++;
     } catch (error) {
       errors.push(
@@ -1316,8 +1578,8 @@ async function adminSystemMaintenance(reason?: string) {
   const runningInstances = allInstances.filter((i) => i.status === "running");
 
   const allSessions = await dynamoManager.getSessionsInTimeRange(
-    now - 24 * 60 * 60,
-    now + 7 * 24 * 60 * 60
+    now - 30 * 24 * 60 * 60, // Last 30 days for any lingering active sessions
+    now + 365 * 24 * 60 * 60 // Next 365 days for all scheduled sessions
   );
   const activeSessions = allSessions.filter(
     (s) => s.status === "active" || s.status === "scheduled"
@@ -1334,6 +1596,35 @@ async function adminSystemMaintenance(reason?: string) {
         status: "cancelled",
         updatedAt: now,
       });
+
+      // Clean up license reservations
+      if (session.licenseId) {
+        try {
+          const reservations = await dynamoManager.getLicenseReservations(
+            session.licenseId,
+            session.startTime,
+            session.endTime
+          );
+
+          for (const reservation of reservations) {
+            if (reservation.sessionId === session.sessionId) {
+              await dynamoManager.updateLicenseReservation(
+                reservation.reservationId,
+                { status: "cancelled" }
+              );
+              console.log(
+                `Cancelled license reservation ${reservation.reservationId} for maintenance-cancelled session ${session.sessionId}`
+              );
+            }
+          }
+        } catch (reservationError) {
+          console.error(
+            `Failed to clean up license reservations for session ${session.sessionId}:`,
+            reservationError
+          );
+        }
+      }
+
       cancelledCount++;
     } catch (error) {
       errors.push(

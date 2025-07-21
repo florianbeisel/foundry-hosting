@@ -35,12 +35,17 @@ export class LicenseScheduler {
     licenseType: "byol" | "pooled",
     startTime: number,
     endTime: number,
-    preferredLicenseId?: string
+    preferredLicenseId?: string,
+    requestingUserId?: string
   ): Promise<LicenseAvailability> {
     if (licenseType === "byol" && preferredLicenseId) {
       return this.checkBYOLAvailability(preferredLicenseId, startTime, endTime);
     } else if (licenseType === "pooled") {
-      return this.checkPooledLicenseAvailability(startTime, endTime);
+      return this.checkPooledLicenseAvailability(
+        startTime,
+        endTime,
+        requestingUserId
+      );
     }
 
     return { available: false };
@@ -100,16 +105,40 @@ export class LicenseScheduler {
   }
 
   /**
-   * Check availability for pooled licenses
+   * Check availability for pooled licenses with smart prioritization
    */
   private async checkPooledLicenseAvailability(
     startTime: number,
-    endTime: number
+    endTime: number,
+    requestingUserId?: string
   ): Promise<LicenseAvailability> {
     const activeLicenses = await this.dynamoManager.getAllActiveLicenses();
     const availableLicenses: string[] = [];
+    const userOwnLicense = `byol-${requestingUserId}`;
 
+    // First, check if the user has their own license available (prioritize it)
+    let userLicenseAvailable = false;
+    if (requestingUserId) {
+      const userLicense = activeLicenses.find(
+        (l) => l.licenseId === userOwnLicense
+      );
+      if (userLicense) {
+        const availability = await this.checkBYOLAvailability(
+          userOwnLicense,
+          startTime,
+          endTime
+        );
+        if (availability.available) {
+          availableLicenses.push(userOwnLicense);
+          userLicenseAvailable = true;
+        }
+      }
+    }
+
+    // Then check other available licenses (but only if user's own license isn't available)
     for (const license of activeLicenses) {
+      if (license.licenseId === userOwnLicense) continue; // Already checked above
+
       const availability = await this.checkBYOLAvailability(
         license.licenseId,
         startTime,
@@ -143,7 +172,8 @@ export class LicenseScheduler {
       request.licenseType,
       request.startTime,
       request.endTime,
-      request.preferredLicenseId
+      request.preferredLicenseId,
+      request.userId // Pass user ID for smart license prioritization
     );
 
     if (!availability.available) {
@@ -161,8 +191,13 @@ export class LicenseScheduler {
       request.licenseType === "pooled" &&
       availability.availableLicenses
     ) {
-      // Use the first available license (could be improved with better allocation logic)
+      // Use the first available license (now prioritized with user's own license first)
       assignedLicenseId = availability.availableLicenses[0];
+      console.log(
+        `Assigned license for pooled session: ${assignedLicenseId} from available: [${availability.availableLicenses.join(
+          ", "
+        )}]`
+      );
     }
 
     if (!assignedLicenseId) {
@@ -388,6 +423,10 @@ export class LicenseScheduler {
       }
 
       // For pooled instances with dynamic license assignment, we need to update credentials
+      console.log(
+        `Starting pooled instance for session. Instance licenseType: ${instance.licenseType}, session.licenseId: ${session.licenseId}, instance.licenseOwnerId: ${instance.licenseOwnerId}`
+      );
+
       if (
         instance.licenseType === "pooled" &&
         session.licenseId &&
