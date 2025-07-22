@@ -711,6 +711,8 @@ const instanceManagementLambda = new aws.lambda.Function(
         // Ko-fi integration
         KOFI_VERIFICATION_TOKEN: config.get("kofiVerificationToken") || "",
         KOFI_URL: config.get("kofiUrl") || "",
+        // Cost configuration
+        INSTANCE_COST_PER_HOUR: "1.00",
       },
     },
     tags: {
@@ -836,8 +838,9 @@ const discordBotTaskDefinition = new aws.ecs.TaskDefinition(
         discordBotRepo.repositoryUrl,
         instanceManagementLambda.name,
         discordBotSecrets.arn,
+        botConfigTable.name,
       ])
-      .apply(([repoUrl, lambdaName, secretArn]) =>
+      .apply(([repoUrl, lambdaName, secretArn, tableName]) =>
         JSON.stringify([
           {
             name: "discord-bot",
@@ -867,7 +870,11 @@ const discordBotTaskDefinition = new aws.ecs.TaskDefinition(
               },
               {
                 name: "BOT_CONFIG_TABLE_NAME",
-                value: botConfigTable.name,
+                value: tableName,
+              },
+              {
+                name: "INSTANCE_COST_PER_HOUR",
+                value: "1.00",
               },
             ],
             secrets: [
@@ -996,6 +1003,8 @@ new aws.iam.RolePolicy(`${projectName}-task-botconfig-policy`, {
             "dynamodb:GetItem",
             "dynamodb:PutItem",
             "dynamodb:UpdateItem",
+            "dynamodb:Scan",
+            "dynamodb:Query",
           ],
           Resource: tableArn,
         },

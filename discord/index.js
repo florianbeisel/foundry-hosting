@@ -35,13 +35,76 @@ if (botConfigTableName) {
 async function loadRegistrationStatsMappingFromDB() {
   if (!botConfigDynamo) return null;
   try {
+    // First try to get the specific item
     const res = await botConfigDynamo.send(
       new GetCommand({
         TableName: botConfigTableName,
         Key: { configKey: "registrationStats" },
       })
     );
-    return res.Item || null;
+
+    if (res.Item && res.Item.channelId && res.Item.messageId) {
+      console.log(
+        `📊 Found registration stats mapping: ${res.Item.channelId} -> ${res.Item.messageId} (updated: ${res.Item.updatedAt})`
+      );
+      return res.Item;
+    }
+
+    // If no valid mapping found, try to scan for any registration-related entries
+    console.log(
+      "🔍 No valid registration stats mapping found, scanning for old entries..."
+    );
+    const { ScanCommand } = require("@aws-sdk/lib-dynamodb");
+
+    const scanRes = await botConfigDynamo.send(
+      new ScanCommand({
+        TableName: botConfigTableName,
+        FilterExpression: "contains(configKey, :key)",
+        ExpressionAttributeValues: {
+          ":key": "registration",
+        },
+      })
+    );
+
+    if (scanRes.Items && scanRes.Items.length > 0) {
+      // Find the most recent valid entry
+      const validEntries = scanRes.Items.filter(
+        (item) => item.channelId && item.messageId
+      ).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+      if (validEntries.length > 0) {
+        const latest = validEntries[0];
+        console.log(
+          `🔄 Found ${validEntries.length} old registration entries, using most recent: ${latest.channelId} -> ${latest.messageId}`
+        );
+
+        // Clean up old entries
+        for (let i = 1; i < validEntries.length; i++) {
+          try {
+            await botConfigDynamo.send(
+              new PutCommand({
+                TableName: botConfigTableName,
+                Item: {
+                  configKey: `registrationStats_old_${i}`,
+                  channelId: null,
+                  messageId: null,
+                  updatedAt: Math.floor(Date.now() / 1000),
+                  cleanedUp: true,
+                },
+              })
+            );
+          } catch (cleanupErr) {
+            console.log(
+              `⚠️ Could not clean up old entry ${i}: ${cleanupErr.message}`
+            );
+          }
+        }
+
+        return latest;
+      }
+    }
+
+    return null;
   } catch (err) {
     console.error("Failed to load registration mapping:", err.message);
     return null;
@@ -49,8 +112,18 @@ async function loadRegistrationStatsMappingFromDB() {
 }
 
 async function saveRegistrationStatsMappingToDB(channelId, messageId) {
-  if (!botConfigDynamo) return;
+  if (!botConfigDynamo) {
+    console.error(
+      "❌ botConfigDynamo not initialized - BOT_CONFIG_TABLE_NAME may not be set"
+    );
+    return false;
+  }
+
   try {
+    console.log(
+      `💾 Saving registration stats mapping: ${channelId} -> ${messageId} to table ${botConfigTableName}`
+    );
+
     await botConfigDynamo.send(
       new PutCommand({
         TableName: botConfigTableName,
@@ -62,21 +135,98 @@ async function saveRegistrationStatsMappingToDB(channelId, messageId) {
         },
       })
     );
+
+    console.log(`✅ Successfully saved registration stats mapping to DynamoDB`);
+    return true;
   } catch (err) {
-    console.error("Failed to save registration mapping:", err.message);
+    console.error(
+      "❌ Failed to save registration mapping to DynamoDB:",
+      err.message
+    );
+    console.error("❌ Error details:", {
+      tableName: botConfigTableName,
+      channelId,
+      messageId,
+      errorCode: err.code,
+      errorType: err.name,
+    });
+    return false;
   }
 }
 
 async function loadAdminStatusMappingFromDB() {
   if (!botConfigDynamo) return null;
   try {
+    // First try to get the specific item
     const res = await botConfigDynamo.send(
       new GetCommand({
         TableName: botConfigTableName,
         Key: { configKey: "adminStatus" },
       })
     );
-    return res.Item || null;
+
+    if (res.Item && res.Item.channelId && res.Item.messageId) {
+      console.log(
+        `🔧 Found admin status mapping: ${res.Item.channelId} -> ${res.Item.messageId} (updated: ${res.Item.updatedAt})`
+      );
+      return res.Item;
+    }
+
+    // If no valid mapping found, try to scan for any admin-related entries
+    console.log(
+      "🔍 No valid admin status mapping found, scanning for old entries..."
+    );
+    const { ScanCommand } = require("@aws-sdk/lib-dynamodb");
+
+    const scanRes = await botConfigDynamo.send(
+      new ScanCommand({
+        TableName: botConfigTableName,
+        FilterExpression: "contains(configKey, :key)",
+        ExpressionAttributeValues: {
+          ":key": "admin",
+        },
+      })
+    );
+
+    if (scanRes.Items && scanRes.Items.length > 0) {
+      // Find the most recent valid entry
+      const validEntries = scanRes.Items.filter(
+        (item) => item.channelId && item.messageId
+      ).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+      if (validEntries.length > 0) {
+        const latest = validEntries[0];
+        console.log(
+          `🔄 Found ${validEntries.length} old admin status entries, using most recent: ${latest.channelId} -> ${latest.messageId}`
+        );
+
+        // Clean up old entries
+        for (let i = 1; i < validEntries.length; i++) {
+          try {
+            await botConfigDynamo.send(
+              new PutCommand({
+                TableName: botConfigTableName,
+                Item: {
+                  configKey: `adminStatus_old_${i}`,
+                  channelId: null,
+                  messageId: null,
+                  updatedAt: Math.floor(Date.now() / 1000),
+                  cleanedUp: true,
+                },
+              })
+            );
+          } catch (cleanupErr) {
+            console.log(
+              `⚠️ Could not clean up old admin entry ${i}: ${cleanupErr.message}`
+            );
+          }
+        }
+
+        return latest;
+      }
+    }
+
+    return null;
   } catch (err) {
     console.error("Failed to load admin status mapping:", err.message);
     return null;
@@ -84,8 +234,18 @@ async function loadAdminStatusMappingFromDB() {
 }
 
 async function saveAdminStatusMappingToDB(channelId, messageId) {
-  if (!botConfigDynamo) return;
+  if (!botConfigDynamo) {
+    console.error(
+      "❌ botConfigDynamo not initialized - BOT_CONFIG_TABLE_NAME may not be set"
+    );
+    return false;
+  }
+
   try {
+    console.log(
+      `💾 Saving admin status mapping: ${channelId} -> ${messageId} to table ${botConfigTableName}`
+    );
+
     await botConfigDynamo.send(
       new PutCommand({
         TableName: botConfigTableName,
@@ -97,8 +257,22 @@ async function saveAdminStatusMappingToDB(channelId, messageId) {
         },
       })
     );
+
+    console.log(`✅ Successfully saved admin status mapping to DynamoDB`);
+    return true;
   } catch (err) {
-    console.error("Failed to save admin status mapping:", err.message);
+    console.error(
+      "❌ Failed to save admin status mapping to DynamoDB:",
+      err.message
+    );
+    console.error("❌ Error details:", {
+      tableName: botConfigTableName,
+      channelId,
+      messageId,
+      errorCode: err.code,
+      errorType: err.name,
+    });
+    return false;
   }
 }
 
@@ -1345,26 +1519,83 @@ client.once("ready", async () => {
   // Clean up any orphaned status monitors on restart
   client.statusMonitors.clear();
 
-  // Restore registration stats mapping from DB
+  // Restore and validate registration stats mapping from DB
   if (botConfigTableName) {
     const mapping = await loadRegistrationStatsMappingFromDB();
     if (mapping && mapping.channelId && mapping.messageId) {
-      client.registrationStats.set(mapping.channelId, mapping.messageId);
-      console.log("✅ Restored registration stats mapping from DynamoDB");
+      console.log(
+        `🔍 Found registration stats mapping: ${mapping.channelId} -> ${mapping.messageId}`
+      );
+
+      // Validate the mapping exists
+      try {
+        const channel = await client.channels.fetch(mapping.channelId);
+        if (channel) {
+          const message = await channel.messages.fetch(mapping.messageId);
+          if (message) {
+            client.registrationStats.set(mapping.channelId, mapping.messageId);
+            console.log(
+              "✅ Validated and restored registration stats mapping from DynamoDB"
+            );
+          } else {
+            console.log(
+              "⚠️ Registration stats message not found, will clean up on first refresh"
+            );
+          }
+        } else {
+          console.log(
+            "⚠️ Registration stats channel not found, will clean up on first refresh"
+          );
+        }
+      } catch (error) {
+        console.log(
+          `⚠️ Error validating registration stats mapping: ${error.message}, will clean up on first refresh`
+        );
+      }
+    } else {
+      console.log("ℹ️ No registration stats mapping found in DynamoDB");
     }
   }
 
-  // Restore admin status mapping
+  // Restore and validate admin status mapping
   if (botConfigTableName) {
     const adminMap = await loadAdminStatusMappingFromDB();
     console.log("🔍 Admin status mapping from DB:", adminMap);
     if (adminMap && adminMap.channelId && adminMap.messageId) {
-      client.adminStatusMapping.set(adminMap.channelId, adminMap.messageId);
       console.log(
-        `✅ Restored admin status mapping: ${adminMap.channelId} -> ${adminMap.messageId}`
+        `🔍 Found admin status mapping: ${adminMap.channelId} -> ${adminMap.messageId}`
       );
+
+      // Validate the mapping exists
+      try {
+        const channel = await client.channels.fetch(adminMap.channelId);
+        if (channel) {
+          const message = await channel.messages.fetch(adminMap.messageId);
+          if (message) {
+            client.adminStatusMapping.set(
+              adminMap.channelId,
+              adminMap.messageId
+            );
+            console.log(
+              "✅ Validated and restored admin status mapping from DynamoDB"
+            );
+          } else {
+            console.log(
+              "⚠️ Admin status message not found, will clean up on first refresh"
+            );
+          }
+        } else {
+          console.log(
+            "⚠️ Admin status channel not found, will clean up on first refresh"
+          );
+        }
+      } catch (error) {
+        console.log(
+          `⚠️ Error validating admin status mapping: ${error.message}, will clean up on first refresh`
+        );
+      }
     } else {
-      console.log("⚠️ No admin status mapping found in DynamoDB");
+      console.log("ℹ️ No admin status mapping found in DynamoDB");
     }
   } else {
     console.log(
@@ -1392,6 +1623,20 @@ client.once("ready", async () => {
   } catch (error) {
     console.log("⚠️ Failed to refresh admin status on startup:", error.message);
   }
+
+  // Set up periodic cleanup of invalid mappings (every 6 hours)
+  cron.schedule("0 */6 * * *", async () => {
+    console.log("🧹 Running periodic cleanup of invalid message mappings...");
+    try {
+      await refreshRegistrationStats();
+      await refreshAdminStatus();
+      console.log("✅ Periodic cleanup completed");
+    } catch (error) {
+      console.error("❌ Periodic cleanup failed:", error.message);
+    }
+  });
+
+  console.log("⏰ Scheduled periodic cleanup every 6 hours");
 });
 
 // Error handling
@@ -1442,13 +1687,28 @@ async function handleSlashCommand(interaction) {
     interaction.deleteUserCommandChannel = (userId) =>
       deleteUserCommandChannel(interaction.guild, userId);
     interaction.startStatusMonitoring = startStatusMonitoring;
-    interaction.addRegistrationStatsMapping = (channelId, messageId) => {
+    interaction.addRegistrationStatsMapping = async (channelId, messageId) => {
       client.registrationStats.set(channelId, messageId);
-      saveRegistrationStatsMappingToDB(channelId, messageId);
+      const saved = await saveRegistrationStatsMappingToDB(
+        channelId,
+        messageId
+      );
+      if (!saved) {
+        console.error(
+          "⚠️ Failed to save registration stats mapping to DynamoDB - mappings will not persist across restarts"
+        );
+      }
+      return saved;
     };
-    interaction.addAdminStatusMapping = (channelId, messageId) => {
+    interaction.addAdminStatusMapping = async (channelId, messageId) => {
       client.adminStatusMapping.set(channelId, messageId);
-      saveAdminStatusMappingToDB(channelId, messageId);
+      const saved = await saveAdminStatusMappingToDB(channelId, messageId);
+      if (!saved) {
+        console.error(
+          "⚠️ Failed to save admin status mapping to DynamoDB - mappings will not persist across restarts"
+        );
+      }
+      return saved;
     };
 
     await command.execute(interaction);
@@ -5012,21 +5272,91 @@ cron.schedule("*/5 * * * *", async () => {
 // Function to refresh all stats embeds in registration channels
 async function refreshRegistrationStats() {
   if (client.registrationStats.size === 0) return;
+
+  console.log(
+    `🔄 Refreshing registration stats for ${client.registrationStats.size} channels`
+  );
+
   try {
     const embed = await buildStatsEmbed();
+    const invalidMappings = [];
+
     for (const [channelId, messageId] of client.registrationStats.entries()) {
       try {
+        console.log(
+          `🔄 Refreshing stats in channel ${channelId}, message ${messageId}`
+        );
         const channel = await client.channels.fetch(channelId);
-        if (!channel) continue;
+        if (!channel) {
+          console.log(`❌ Channel ${channelId} not found, marking for cleanup`);
+          invalidMappings.push(channelId);
+          continue;
+        }
+
         const message = await channel.messages.fetch(messageId);
-        if (!message) continue;
+        if (!message) {
+          console.log(
+            `❌ Message ${messageId} not found in channel ${channelId}, marking for cleanup`
+          );
+          invalidMappings.push(channelId);
+          continue;
+        }
+
         await message.edit({ embeds: [embed] });
+        console.log(`✅ Successfully refreshed stats in channel ${channelId}`);
       } catch (err) {
-        console.error(`Failed to refresh stats in ${channelId}:`, err.message);
+        console.error(
+          `❌ Failed to refresh stats in ${channelId}:`,
+          err.message
+        );
+
+        // Check if it's a "not found" error and mark for cleanup
+        if (
+          err.message.includes("Unknown Message") ||
+          err.message.includes("Unknown Channel")
+        ) {
+          console.log(`🔧 Marking invalid mapping for cleanup: ${channelId}`);
+          invalidMappings.push(channelId);
+        }
       }
     }
+
+    // Clean up invalid mappings
+    for (const channelId of invalidMappings) {
+      console.log(
+        `🧹 Cleaning up invalid registration stats mapping: ${channelId}`
+      );
+      client.registrationStats.delete(channelId);
+
+      // Also remove from DynamoDB if we have access
+      if (botConfigTableName) {
+        try {
+          await botConfigDynamo.send(
+            new PutCommand({
+              TableName: botConfigTableName,
+              Item: {
+                configKey: "registrationStats",
+                channelId: null,
+                messageId: null,
+                updatedAt: Math.floor(Date.now() / 1000),
+              },
+            })
+          );
+          console.log(`✅ Cleared invalid mapping from DynamoDB`);
+        } catch (dbErr) {
+          console.error(
+            `❌ Failed to clear invalid mapping from DynamoDB:`,
+            dbErr.message
+          );
+        }
+      }
+    }
+
+    console.log(
+      `✅ Registration stats refresh completed. Cleaned up ${invalidMappings.length} invalid mappings.`
+    );
   } catch (e) {
-    console.error("Failed to build stats embed:", e.message);
+    console.error("❌ Failed to build stats embed:", e.message);
   }
 }
 
@@ -5044,6 +5374,8 @@ async function refreshAdminStatus() {
     console.log("✅ Built admin status embed for refresh");
 
     let updatedCount = 0;
+    const invalidMappings = [];
+
     for (const [channelId, messageId] of client.adminStatusMapping.entries()) {
       try {
         console.log(
@@ -5051,12 +5383,18 @@ async function refreshAdminStatus() {
         );
         const channel = await client.channels.fetch(channelId);
         if (!channel) {
-          console.log(`❌ Channel ${channelId} not found during refresh`);
+          console.log(
+            `❌ Channel ${channelId} not found during refresh, marking for cleanup`
+          );
+          invalidMappings.push(channelId);
           continue;
         }
         const msg = await channel.messages.fetch(messageId);
         if (!msg) {
-          console.log(`❌ Message ${messageId} not found during refresh`);
+          console.log(
+            `❌ Message ${messageId} not found during refresh, marking for cleanup`
+          );
+          invalidMappings.push(channelId);
           continue;
         }
         await msg.edit({
@@ -5070,11 +5408,51 @@ async function refreshAdminStatus() {
           `❌ Failed to refresh admin status in ${channelId}:`,
           err.message
         );
+
+        // Check if it's a "not found" error and mark for cleanup
+        if (
+          err.message.includes("Unknown Message") ||
+          err.message.includes("Unknown Channel")
+        ) {
+          console.log(
+            `🔧 Marking invalid admin status mapping for cleanup: ${channelId}`
+          );
+          invalidMappings.push(channelId);
+        }
+      }
+    }
+
+    // Clean up invalid mappings
+    for (const channelId of invalidMappings) {
+      console.log(`🧹 Cleaning up invalid admin status mapping: ${channelId}`);
+      client.adminStatusMapping.delete(channelId);
+
+      // Also remove from DynamoDB if we have access
+      if (botConfigTableName) {
+        try {
+          await botConfigDynamo.send(
+            new PutCommand({
+              TableName: botConfigTableName,
+              Item: {
+                configKey: "adminStatus",
+                channelId: null,
+                messageId: null,
+                updatedAt: Math.floor(Date.now() / 1000),
+              },
+            })
+          );
+          console.log(`✅ Cleared invalid admin status mapping from DynamoDB`);
+        } catch (dbErr) {
+          console.error(
+            `❌ Failed to clear invalid admin status mapping from DynamoDB:`,
+            dbErr.message
+          );
+        }
       }
     }
 
     console.log(
-      `✅ refreshAdminStatus completed: ${updatedCount} channels updated`
+      `✅ refreshAdminStatus completed: ${updatedCount} channels updated, cleaned up ${invalidMappings.length} invalid mappings`
     );
   } catch (e) {
     console.error("❌ Failed to build admin status embed:", e.message);

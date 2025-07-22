@@ -82,12 +82,15 @@ yarn deploy
 
 ### User Commands
 
-- **`/foundry dashboard`** - Show instance dashboard with controls
-- **`/foundry help`** - Display help information
+- **`/foundry user dashboard`** - Show instance dashboard with controls
+- **`/foundry user help`** - Display help information
 
 ### Admin Commands
 
-- **`/foundry setup-registration`** - Create permanent registration message
+- **`/foundry admin overview`** - View system status and monitoring details
+- **`/foundry admin setup-registration`** - Create permanent registration message
+- **`/foundry admin recreate-registration`** - Recreate registration message if lost
+- **`/foundry admin cleanup-mappings`** - Clean up old message mappings from DynamoDB
 
 ### Dashboard Features
 
@@ -107,6 +110,8 @@ When the Discord bot restarts, it automatically:
 4. **Sends Welcome Message** - Notifies users of bot restart
 5. **Posts Current Status** - Displays up-to-date instance status
 6. **Restores Monitoring** - Re-establishes real-time status monitoring
+7. **Validates Message Mappings** - Checks registration and admin status messages
+8. **Cleans Invalid Mappings** - Removes broken message references automatically
 
 ### Channel Detection Strategies
 
@@ -125,7 +130,7 @@ This ensures channels are found even if Discord usernames have changed.
 Administrators can create permanent registration channels:
 
 ```bash
-/foundry setup-registration [channel:#registration]
+/foundry admin setup-registration [channel:#registration]
 ```
 
 ### Features
@@ -245,6 +250,8 @@ The bot implements comprehensive error handling:
 - **User Feedback** - Clear error messages for users
 - **Retry Logic** - Automatic retries for transient failures
 - **Logging** - Detailed logging for debugging
+- **Message Mapping Cleanup** - Automatic cleanup of invalid message references
+- **Periodic Validation** - Scheduled cleanup every 6 hours to prevent mapping issues
 
 ## 🔗 Dependencies
 
@@ -254,3 +261,21 @@ The bot implements comprehensive error handling:
 - **@aws-sdk/lib-dynamodb** - DynamoDB document client
 - **node-cron** - Scheduled task management
 - **dotenv** - Environment variable management
+
+## 🔧 Troubleshooting
+
+### Lost Registration or Admin Status Messages
+
+If the bot loses track of registration or admin status messages after a restart:
+
+1. **Automatic Cleanup** - The bot automatically detects and cleans invalid mappings on restart
+2. **Manual Recreation** - Use `/foundry admin recreate-registration` to recreate lost registration messages
+3. **Admin Status** - Use `/foundry admin overview` to recreate lost admin status messages
+4. **Cleanup Command** - Use `/foundry admin cleanup-mappings` to clean up old DynamoDB entries
+5. **Diagnostic Script** - Run `node cleanup-mappings.js` to check mapping status
+
+### Common Issues
+
+- **Messages Not Updating** - Check bot permissions in the channel
+- **Mapping Errors** - Invalid mappings are automatically cleaned up every 6 hours
+- **Restart Issues** - Bot validates all mappings on startup and logs any issues
