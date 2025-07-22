@@ -2,3 +2,9 @@
 **/node_modules/
 **/dist/
 Backups
+
+# Environment files
+.env
+**/.env
+**/.env.*
+!.env.example
