@@ -10,6 +10,7 @@ import {
   DynamoDBManager,
   ScheduledSession,
   LicensePool,
+  FoundryInstance,
 } from "./utils/dynamodb-manager";
 import { ALBManager } from "./utils/alb-manager";
 import { Route53Manager } from "./utils/route53-manager";
@@ -34,6 +35,7 @@ interface FoundryEvent {
     | "cancel-session"
     | "list-sessions"
     | "set-license-sharing"
+    | "manage-license-state"
     | "check-availability"
     | "start-scheduled-session"
     | "end-scheduled-session"
@@ -73,6 +75,13 @@ interface FoundryEvent {
   selectedLicenseId?: string;
   // Destroy options
   keepLicenseSharing?: boolean;
+  // License state management
+  licenseStateOperation?:
+    | "schedule_stop_after_sessions"
+    | "cancel_scheduled_stop"
+    | "immediate_stop"
+    | "reactivate_sharing"
+    | "cleanup_orphaned";
   // Ko-fi webhook fields
   body?: string;
   headers?: Record<string, string>;
@@ -161,6 +170,9 @@ export const handler = async (
         break;
       case "set-license-sharing":
         result = await setLicenseSharing(userId, event);
+        break;
+      case "manage-license-state":
+        result = await manageLicenseState(userId, event);
         break;
       case "check-availability":
         result = await checkLicenseAvailability(event);
@@ -252,8 +264,8 @@ async function createInstance(userId: string, event: FoundryEvent) {
     selectedLicenseId,
   } = event;
 
-  let actualFoundryUsername: string;
-  let actualFoundryPassword: string;
+  let actualFoundryUsername: string | null;
+  let actualFoundryPassword: string | null;
 
   // Validate license type
   const validatedLicenseType = licenseType || "byol";
@@ -314,9 +326,10 @@ async function createInstance(userId: string, event: FoundryEvent) {
       }
     } else {
       // Case 2: No specific license - will be assigned at start/schedule time
-      // For now, we don't store any credentials. They'll be obtained when starting instance.
-      actualFoundryUsername = "POOLED_DYNAMIC"; // Placeholder
-      actualFoundryPassword = "POOLED_DYNAMIC"; // Placeholder
+      // For dynamic pooled instances, we don't store credentials initially
+      // They will be set when the instance is actually started for a session
+      actualFoundryUsername = null; // Will be set when session starts
+      actualFoundryPassword = null; // Will be set when session starts
       console.log(
         `Creating pooled instance with dynamic license assignment for user: ${userId}`
       );
@@ -377,12 +390,22 @@ async function createInstance(userId: string, event: FoundryEvent) {
   }
 
   // Store credentials in Secrets Manager
-  secretArn = await secretsManager.storeCredentials(
-    userId,
-    actualFoundryUsername,
-    actualFoundryPassword,
-    adminKey
-  );
+  if (actualFoundryUsername && actualFoundryPassword) {
+    // Only store credentials if we have valid ones (BYOL or specific pooled license)
+    secretArn = await secretsManager.storeCredentials(
+      userId,
+      actualFoundryUsername,
+      actualFoundryPassword,
+      adminKey
+    );
+  } else {
+    // For dynamic pooled instances, we don't store credentials initially
+    // They will be set when the instance is actually started for a session
+    secretArn = ""; // Will be set when credentials are stored
+    console.log(
+      `Skipping credential storage for dynamic pooled instance: ${userId}`
+    );
+  }
 
   // Create S3 bucket for static assets
   const s3BucketName = await s3Manager.createFoundryBucket(
@@ -433,12 +456,11 @@ async function createInstance(userId: string, event: FoundryEvent) {
   });
 
   // Create instance record with ALB and S3 info
-  const instance = await dynamoManager.createInstance({
+  const instanceData: FoundryInstance = {
     userId,
     sanitizedUsername,
     status: "created",
     accessPointId,
-    secretArn,
     adminKey,
     foundryVersion: "13", // Default to latest stable version
     s3BucketName,
@@ -452,7 +474,14 @@ async function createInstance(userId: string, event: FoundryEvent) {
     licenseOwnerId: finalLicenseOwnerId,
     createdAt: Math.floor(Date.now() / 1000),
     updatedAt: Math.floor(Date.now() / 1000),
-  });
+  };
+
+  // Only add secretArn if it exists
+  if (secretArn) {
+    instanceData.secretArn = secretArn;
+  }
+
+  const instance = await dynamoManager.createInstance(instanceData);
 
   // Debug logging after DynamoDB call
   console.log(`✅ Created instance with license fields:`, {
@@ -543,7 +572,7 @@ async function startInstance(userId: string) {
     userId,
     instance.sanitizedUsername,
     instance.accessPointId,
-    instance.secretArn,
+    instance.secretArn || "", // Provide empty string if secretArn is undefined
     instance.s3BucketName,
     instance.s3AccessKeyId,
     instance.s3SecretAccessKey,
@@ -1223,6 +1252,250 @@ async function setLicenseSharing(userId: string, event: FoundryEvent) {
     allowLicenseSharing: event.allowLicenseSharing,
     maxConcurrentUsers: event.maxConcurrentUsers,
     instanceFound: !!instance,
+  };
+}
+
+/**
+ * Enhanced license state management function
+ * Handles complex license state transitions and edge cases
+ */
+async function manageLicenseState(userId: string, event: FoundryEvent) {
+  const instance = await dynamoManager.getInstance(userId);
+  const now = Math.floor(Date.now() / 1000);
+
+  // Handle different license state operations
+  const operation = event.licenseStateOperation;
+
+  if (!operation) {
+    return {
+      success: false,
+      message: "Missing license state operation",
+    };
+  }
+
+  switch (operation) {
+    case "schedule_stop_after_sessions":
+      return await scheduleLicenseSharingStop(userId, instance, now);
+
+    case "cancel_scheduled_stop":
+      return await cancelScheduledLicenseSharingStop(userId, instance, now);
+
+    case "immediate_stop":
+      return await stopLicenseSharingImmediately(userId, instance, now);
+
+    case "reactivate_sharing":
+      return await reactivateLicenseSharing(userId, instance, now);
+
+    case "cleanup_orphaned":
+      return await cleanupOrphanedLicenseState(userId, instance, now);
+
+    default:
+      return {
+        success: false,
+        message: `Unknown license state operation: ${operation}`,
+      };
+  }
+}
+
+async function scheduleLicenseSharingStop(
+  userId: string,
+  instance: FoundryInstance | null,
+  now: number
+) {
+  if (!instance) {
+    return {
+      success: false,
+      message: "No instance found to manage license state",
+    };
+  }
+
+  if (instance.licenseType !== "byol") {
+    return {
+      success: false,
+      message: "Only BYOL instances can manage license sharing",
+    };
+  }
+
+  // Set the scheduled stop flag
+  await dynamoManager.updateInstance(userId, {
+    stopSharingAfterSessions: true,
+    licenseSharingState: "scheduled_stop",
+    lastLicenseSharingChange: now,
+    updatedAt: now,
+  });
+
+  return {
+    success: true,
+    message: "License sharing scheduled to stop after current sessions end",
+    licenseSharingState: "scheduled_stop",
+  };
+}
+
+async function cancelScheduledLicenseSharingStop(
+  userId: string,
+  instance: FoundryInstance | null,
+  now: number
+) {
+  if (!instance) {
+    return {
+      success: false,
+      message: "No instance found to manage license state",
+    };
+  }
+
+  // Cancel the scheduled stop
+  await dynamoManager.updateInstance(userId, {
+    stopSharingAfterSessions: false,
+    licenseSharingScheduledStop: undefined,
+    licenseSharingState: "active",
+    lastLicenseSharingChange: now,
+    updatedAt: now,
+  });
+
+  return {
+    success: true,
+    message: "Scheduled license sharing stop cancelled",
+    licenseSharingState: "active",
+  };
+}
+
+async function stopLicenseSharingImmediately(
+  userId: string,
+  instance: FoundryInstance | null,
+  now: number
+) {
+  if (!instance) {
+    return {
+      success: false,
+      message: "No instance found to manage license state",
+    };
+  }
+
+  // Stop license sharing immediately
+  await dynamoManager.updateInstance(userId, {
+    allowLicenseSharing: false,
+    stopSharingAfterSessions: false,
+    licenseSharingScheduledStop: undefined,
+    licenseSharingState: "inactive",
+    lastLicenseSharingChange: now,
+    updatedAt: now,
+  });
+
+  // Deactivate license pool
+  const licenseId = `byol-${userId}`;
+  try {
+    const existingPool = await dynamoManager.getLicensePool(licenseId);
+    if (existingPool && existingPool.isActive) {
+      await dynamoManager.updateLicensePool(licenseId, {
+        isActive: false,
+        updatedAt: now,
+      });
+    }
+  } catch (error) {
+    console.error(`Failed to deactivate license pool ${licenseId}:`, error);
+  }
+
+  return {
+    success: true,
+    message: "License sharing stopped immediately",
+    licenseSharingState: "inactive",
+  };
+}
+
+async function reactivateLicenseSharing(
+  userId: string,
+  instance: FoundryInstance | null,
+  now: number
+) {
+  if (!instance) {
+    return {
+      success: false,
+      message: "No instance found to manage license state",
+    };
+  }
+
+  if (instance.licenseType !== "byol") {
+    return {
+      success: false,
+      message: "Only BYOL instances can reactivate license sharing",
+    };
+  }
+
+  // Reactivate license sharing
+  await dynamoManager.updateInstance(userId, {
+    allowLicenseSharing: true,
+    stopSharingAfterSessions: false,
+    licenseSharingScheduledStop: undefined,
+    licenseSharingState: "active",
+    lastLicenseSharingChange: now,
+    updatedAt: now,
+  });
+
+  // Reactivate license pool
+  const licenseId = `byol-${userId}`;
+  try {
+    const existingPool = await dynamoManager.getLicensePool(licenseId);
+    if (existingPool) {
+      await dynamoManager.updateLicensePool(licenseId, {
+        isActive: true,
+        updatedAt: now,
+      });
+    } else {
+      // Create new pool if it doesn't exist
+      await dynamoManager.createLicensePool({
+        licenseId,
+        ownerId: userId,
+        ownerUsername: instance.sanitizedUsername,
+        maxConcurrentUsers: instance.maxConcurrentUsers || 1,
+        isActive: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+  } catch (error) {
+    console.error(`Failed to reactivate license pool ${licenseId}:`, error);
+  }
+
+  return {
+    success: true,
+    message: "License sharing reactivated",
+    licenseSharingState: "active",
+  };
+}
+
+async function cleanupOrphanedLicenseState(
+  userId: string,
+  instance: FoundryInstance | null,
+  now: number
+) {
+  // Handle case where user has no instance but still has license sharing state
+  if (!instance) {
+    // Check if there's an orphaned license pool
+    const licenseId = `byol-${userId}`;
+    try {
+      const existingPool = await dynamoManager.getLicensePool(licenseId);
+      if (existingPool && existingPool.isActive) {
+        await dynamoManager.updateLicensePool(licenseId, {
+          isActive: false,
+          updatedAt: now,
+        });
+        return {
+          success: true,
+          message: "Orphaned license pool deactivated",
+          licenseSharingState: "orphaned",
+        };
+      }
+    } catch (error) {
+      console.error(
+        `Failed to cleanup orphaned license pool ${licenseId}:`,
+        error
+      );
+    }
+  }
+
+  return {
+    success: false,
+    message: "No orphaned license state found to cleanup",
   };
 }
 

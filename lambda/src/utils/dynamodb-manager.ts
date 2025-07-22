@@ -14,7 +14,7 @@ export interface FoundryInstance {
   sanitizedUsername: string;
   status: string;
   accessPointId: string;
-  secretArn: string;
+  secretArn?: string; // Optional for dynamic pooled instances that don't have credentials initially
   adminKey: string;
   foundryVersion?: string;
   s3BucketName?: string;
@@ -33,6 +33,11 @@ export interface FoundryInstance {
   licenseOwnerId?: string; // For pooled licenses, who owns the license being used
   allowLicenseSharing?: boolean; // For BYOL users, whether they share their license to the pool
   maxConcurrentUsers?: number; // For license owners, how many concurrent users allowed
+  // Enhanced license state management
+  stopSharingAfterSessions?: boolean; // Flag to stop sharing after current sessions end
+  licenseSharingScheduledStop?: number; // Timestamp when sharing should stop (after sessions)
+  licenseSharingState?: "active" | "scheduled_stop" | "inactive" | "orphaned"; // Current sharing state
+  lastLicenseSharingChange?: number; // Timestamp of last sharing state change
   // Auto-shutdown fields
   startedAt?: number; // When the instance was started (for auto-shutdown)
   autoShutdownAt?: number; // When the instance should be automatically shut down

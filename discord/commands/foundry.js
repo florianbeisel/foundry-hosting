@@ -11,6 +11,27 @@ const {
 } = require("discord.js");
 const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
 
+// =================
+// SUPPORTER ROLES
+// =================
+
+const SUPPORTER_ROLES = {
+  "699727231794020353": 15, // $15 supporter
+  "699727011979067484": 10, // $10 supporter
+  "699727432424620033": 5, // $5 supporter
+};
+
+function getUserSupporterAmount(member) {
+  if (!member) return 0;
+
+  for (const [roleId, amount] of Object.entries(SUPPORTER_ROLES)) {
+    if (member.roles.cache.has(roleId)) {
+      return amount;
+    }
+  }
+  return 0;
+}
+
 module.exports = {
   data: new SlashCommandBuilder()
     .setName("foundry")
@@ -26,6 +47,11 @@ module.exports = {
         )
         .addSubcommand((subcommand) =>
           subcommand.setName("help").setDescription("Display help information")
+        )
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("license-sharing")
+            .setDescription("Manage your license sharing status")
         )
     )
     .addSubcommandGroup((group) =>
@@ -63,6 +89,17 @@ module.exports = {
           subcommand
             .setName("cleanup-mappings")
             .setDescription("Clean up old message mappings from DynamoDB")
+        )
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("test-log")
+            .setDescription("Send a test log message to the logging channel")
+            .addStringOption((option) =>
+              option
+                .setName("message")
+                .setDescription("Test message to log")
+                .setRequired(true)
+            )
         )
     ),
 
@@ -106,6 +143,40 @@ module.exports = {
       }
 
       return JSON.parse(response.body);
+    };
+
+    interaction.getUserCostsWithSupporter = async (userId) => {
+      try {
+        // Get user's supporter amount
+        let supporterAmount = 0;
+        if (interaction.guild && interaction.member) {
+          supporterAmount = getUserSupporterAmount(interaction.member);
+        }
+
+        // Get base cost data from Lambda
+        const costData = await interaction.invokeLambda({
+          action: "get-user-costs",
+          userId: userId,
+        });
+
+        // Apply supporter discount
+        const supporterDiscount = supporterAmount;
+        const adjustedUncoveredCost = Math.max(
+          0,
+          costData.uncoveredCost - supporterDiscount
+        );
+
+        return {
+          ...costData,
+          supporterAmount,
+          supporterDiscount,
+          adjustedUncoveredCost,
+          isSupporter: supporterAmount > 0,
+        };
+      } catch (error) {
+        console.error("Error getting user costs with supporter info:", error);
+        throw error;
+      }
     };
 
     interaction.createUserCommandChannel = (userId, username) =>
@@ -158,6 +229,9 @@ module.exports = {
         case "help":
           await handleHelp(interaction);
           break;
+        case "license-sharing":
+          await handleLicenseSharing(interaction, interaction.user.id);
+          break;
         default:
           await interaction.reply({
             content: "❌ Unknown user command.",
@@ -189,6 +263,9 @@ module.exports = {
           break;
         case "cleanup-mappings":
           await handleCleanupMappings(interaction);
+          break;
+        case "test-log":
+          await handleTestLog(interaction);
           break;
         default:
           await interaction.reply({
@@ -239,8 +316,8 @@ async function handleDashboard(interaction, userId) {
         result.licenseOwnerId &&
         result.licenseOwnerId !== `byol-${result.userId}`
       ) {
-        // Has a license owner that's not themselves = pooled instance
-        licenseDisplay = "🌐 Pooled (Shared License)";
+        // Has a license owner that's not themselves = shared instance
+        licenseDisplay = "🌐 Shared Instance (Community License)";
         // Try to get owner info
         try {
           const adminResult = await interaction.invokeLambda({
@@ -253,7 +330,7 @@ async function handleDashboard(interaction, userId) {
             );
             if (licensePool) {
               licenseOwnerInfo = licensePool.ownerUsername;
-              licenseDisplay = `🌐 Pooled (${licenseOwnerInfo}'s License)`;
+              licenseDisplay = `🌐 Shared Instance (${licenseOwnerInfo}'s License Pool)`;
             }
           }
         } catch (error) {
@@ -262,15 +339,15 @@ async function handleDashboard(interaction, userId) {
       } else {
         // Default to BYOL for missing data
         licenseDisplay = `🔑 BYOL (Own License)${
-          result.allowLicenseSharing ? " - Shared" : ""
+          result.allowLicenseSharing ? " - Pooled" : ""
         }`;
       }
     } else if (licenseType === "byol") {
       licenseDisplay = `🔑 BYOL (Own License)${
-        result.allowLicenseSharing ? " - Shared" : ""
+        result.allowLicenseSharing ? " - Pooled" : ""
       }`;
     } else if (licenseType === "pooled") {
-      // Get license owner info for pooled instances
+      // Get license owner info for shared instances
       if (result.licenseOwnerId) {
         try {
           const adminResult = await interaction.invokeLambda({
@@ -284,33 +361,29 @@ async function handleDashboard(interaction, userId) {
             );
             if (licensePool) {
               licenseOwnerInfo = licensePool.ownerUsername;
-              licenseDisplay = `🌐 Pooled (${licenseOwnerInfo}'s License)`;
+              licenseDisplay = `🌐 Shared Instance (${licenseOwnerInfo}'s License Pool)`;
             } else {
-              licenseDisplay = "🌐 Pooled (Shared License)";
+              licenseDisplay = "🌐 Shared Instance (Community License)";
             }
           } else {
-            licenseDisplay = "🌐 Pooled (Shared License)";
+            licenseDisplay = "🌐 Shared Instance (Community License)";
           }
         } catch (error) {
           console.log("Could not fetch license owner info for dashboard");
-          licenseDisplay = "🌐 Pooled (Shared License)";
+          licenseDisplay = "🌐 Shared Instance (Community License)";
         }
       } else {
-        licenseDisplay = "🌐 Pooled (Automatic Assignment)";
+        licenseDisplay = "🌐 Shared Instance (Automatic Assignment)";
       }
     } else {
       // Unknown license type
       licenseDisplay = `❔ Unknown License Type: ${licenseType}`;
     }
 
-    // Get monthly cost data for dashboard display
+    // Get monthly cost data with supporter information
     let costData = null;
     try {
-      const costResult = await interaction.invokeLambda({
-        action: "get-user-costs",
-        userId: userId,
-      });
-      costData = costResult;
+      costData = await interaction.getUserCostsWithSupporter(userId);
     } catch (error) {
       console.log("Could not fetch cost data for dashboard:", error);
     }
@@ -342,17 +415,40 @@ async function handleDashboard(interaction, userId) {
                 )}h** = $${costData.totalCost.toFixed(2)}`,
                 inline: true,
               },
-              {
-                name:
-                  costData.uncoveredCost > 0
-                    ? "💸 Uncovered Cost"
-                    : "✅ Fully Covered",
-                value:
-                  costData.uncoveredCost > 0
-                    ? `$${costData.uncoveredCost.toFixed(2)}`
-                    : "All costs covered! 🎉",
-                inline: true,
-              },
+              ...(costData.isSupporter
+                ? [
+                    {
+                      name: "🎖️ Supporter Discount",
+                      value: `$${costData.supporterAmount.toFixed(
+                        2
+                      )} monthly credit`,
+                      inline: true,
+                    },
+                    {
+                      name:
+                        costData.adjustedUncoveredCost > 0
+                          ? "💸 Remaining Cost"
+                          : "✅ Fully Covered",
+                      value:
+                        costData.adjustedUncoveredCost > 0
+                          ? `$${costData.adjustedUncoveredCost.toFixed(2)}`
+                          : "All costs covered! 🎉",
+                      inline: true,
+                    },
+                  ]
+                : [
+                    {
+                      name:
+                        costData.uncoveredCost > 0
+                          ? "💸 Uncovered Cost"
+                          : "✅ Fully Covered",
+                      value:
+                        costData.uncoveredCost > 0
+                          ? `$${costData.uncoveredCost.toFixed(2)}`
+                          : "All costs covered! 🎉",
+                      inline: true,
+                    },
+                  ]),
               ...(costData.donationsReceived > 0
                 ? [
                     {
@@ -448,140 +544,14 @@ async function handleDashboard(interaction, userId) {
       ]);
     }
 
-    const actionRow = new ActionRowBuilder();
-
-    // Different buttons based on license type and status
-    if (
-      licenseType === "byol" &&
-      (result.status === "stopped" || result.status === "created")
-    ) {
-      actionRow.addComponents(
-        new ButtonBuilder()
-          .setCustomId(`foundry_start_${userId}`)
-          .setLabel("Start Instance")
-          .setStyle(ButtonStyle.Success)
-          .setEmoji("🚀")
-      );
-    }
-
-    if (result.status === "running") {
-      actionRow.addComponents(
-        new ButtonBuilder()
-          .setCustomId(`foundry_stop_${userId}`)
-          .setLabel("Stop Instance")
-          .setStyle(ButtonStyle.Danger)
-          .setEmoji("⏹️")
-      );
-    }
-
-    // Add scheduling button for all users
-    actionRow.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`foundry_schedule_${userId}`)
-        .setLabel("Schedule Session")
-        .setStyle(ButtonStyle.Primary)
-        .setEmoji("📅")
+    // Use the unified dashboard function instead of building components here
+    await interaction.sendUnifiedDashboard(
+      interaction.channel,
+      userId,
+      result,
+      "dashboard"
     );
-
-    actionRow.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`foundry_sessions_${userId}`)
-        .setLabel("My Sessions")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("📋"),
-      new ButtonBuilder()
-        .setCustomId(`foundry_status_${userId}`)
-        .setLabel("Refresh")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("🔄")
-    );
-
-    // Second row for less common actions
-    const secondRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`foundry_adminkey_${userId}`)
-        .setLabel("Get Admin Key")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("🔑"),
-      new ButtonBuilder()
-        .setCustomId(`foundry_destroy_${userId}`)
-        .setLabel("Destroy")
-        .setStyle(ButtonStyle.Danger)
-        .setEmoji("💀")
-    );
-
-    // Third row for Ko-fi donation if uncovered costs exist
-    let thirdRow = null;
-    if (costData && costData.uncoveredCost > 0 && process.env.KOFI_URL) {
-      const suggestedAmount = Math.min(costData.uncoveredCost, 5).toFixed(2);
-      thirdRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setURL(process.env.KOFI_URL)
-          .setLabel(`☕ Cover $${suggestedAmount} on Ko-fi`)
-          .setStyle(ButtonStyle.Link)
-          .setEmoji("💖")
-      );
-    }
-
-    // Create version selection dropdown
-    const currentVersion = result.foundryVersion || "13";
-    const versionLabels = {
-      13: "v13 - Latest Stable",
-      release: "Release - Current Stable",
-      12: "v12 - Previous Major",
-      11: "v11 - Legacy Major",
-      "13.346.0": "v13.346.0 - Specific Build",
-      latest: "Latest - Bleeding Edge",
-    };
-
-    const versionSelectRow = new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId(`foundry_version_${userId}`)
-        .setPlaceholder(
-          `🔧 Current: ${versionLabels[currentVersion] || currentVersion}`
-        )
-        .addOptions([
-          new StringSelectMenuOptionBuilder()
-            .setLabel("v13 - Latest Stable (Recommended)")
-            .setDescription("Auto-updates to newest v13 stable release")
-            .setValue("13")
-            .setEmoji("🏆"),
-          new StringSelectMenuOptionBuilder()
-            .setLabel("Release - Current Stable")
-            .setDescription("Latest tested and verified release")
-            .setValue("release")
-            .setEmoji("✅"),
-          new StringSelectMenuOptionBuilder()
-            .setLabel("v12 - Previous Major")
-            .setDescription("Latest v12 release (downgrade option)")
-            .setValue("12")
-            .setEmoji("🔄"),
-          new StringSelectMenuOptionBuilder()
-            .setLabel("v11 - Legacy Major")
-            .setDescription("Latest v11 release (legacy option)")
-            .setValue("11")
-            .setEmoji("📼"),
-          new StringSelectMenuOptionBuilder()
-            .setLabel("v13.346.0 - Specific Build")
-            .setDescription("Fixed to exact v13.346.0 build")
-            .setValue("13.346.0")
-            .setEmoji("📌"),
-          new StringSelectMenuOptionBuilder()
-            .setLabel("Latest - Bleeding Edge")
-            .setDescription("Most recent build (may be unstable)")
-            .setValue("latest")
-            .setEmoji("⚡"),
-        ])
-    );
-
-    const components = [actionRow, secondRow];
-    if (thirdRow) components.push(thirdRow);
-    components.push(versionSelectRow);
-
-    await interaction.editReply({
-      embeds: [embed],
-      components: components,
-    });
+    return;
   } catch (error) {
     if (error.message.includes("not found")) {
       // User doesn't have an instance - show registration
@@ -611,10 +581,11 @@ async function handleHelp(interaction) {
       {
         name: "Commands",
         value:
-          "`/foundry dashboard` – personal control panel\n" +
-          "`/foundry help` – this help message\n" +
-          "`/foundry setup-registration` – post registration embed (admin)\n" +
-          "`/admin-status` – system-wide status (admin)",
+          "`/foundry user dashboard` – personal control panel\n" +
+          "`/foundry user help` – this help message\n" +
+          "`/foundry user license-sharing` – manage license sharing\n" +
+          "`/foundry admin overview` – system-wide status (admin)\n" +
+          "`/foundry admin setup-registration` – post registration embed (admin)",
       },
     ])
     .setFooter({ text: "Need more information? Contact an administrator." })
@@ -623,29 +594,133 @@ async function handleHelp(interaction) {
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
 
+async function handleLicenseSharing(interaction, userId) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  try {
+    // Check if user has an instance
+    const result = await interaction.invokeLambda({
+      action: "status",
+      userId: userId,
+    });
+
+    if (!result || result.status === "not_found") {
+      return await interaction.editReply({
+        content:
+          "❌ You don't have a Foundry VTT instance. Please register one first using `/foundry user dashboard`.",
+      });
+    }
+
+    // Check if user has a BYOL instance (only BYOL instances can share licenses)
+    if (result.licenseType !== "byol") {
+      return await interaction.editReply({
+        content:
+          "❌ Only BYOL (Bring Your Own License) instances can share licenses. Your instance uses a shared license from the community pool.",
+      });
+    }
+
+    // Get current license sharing status
+    const isCurrentlySharing = result.allowLicenseSharing || false;
+
+    // Create embed explaining license sharing
+    const embed = new EmbedBuilder()
+      .setColor("#0099ff")
+      .setTitle("🔑 License Sharing Management")
+      .setDescription(
+        isCurrentlySharing
+          ? "Your license is currently **pooled with the community** and available for others to use."
+          : "Your license is currently **private** and only used by your own instance."
+      )
+      .addFields([
+        {
+          name: "🤝 What is License Pooling?",
+          value:
+            "• Share your Foundry license with the community\n" +
+            "• Others can schedule sessions using your license\n" +
+            "• You get priority access to your own license\n" +
+            "• Help others who don't have their own license",
+          inline: false,
+        },
+        {
+          name: "📋 Current Status",
+          value: isCurrentlySharing
+            ? "🟢 **License Pooled**"
+            : "🔴 **License Private**",
+          inline: true,
+        },
+        {
+          name: "🎯 Your Priority",
+          value:
+            "You always get priority access to your own license, even when shared",
+          inline: true,
+        },
+      ])
+      .setFooter({
+        text: isCurrentlySharing
+          ? "Click 'Stop Pooling' to make your license private again"
+          : "Click 'Start Pooling' to share your license with the community",
+      })
+      .setTimestamp();
+
+    // Create action buttons
+    const actionRow = new ActionRowBuilder().addComponents(
+      isCurrentlySharing
+        ? new ButtonBuilder()
+            .setCustomId(`foundry_stop_sharing_${userId}`)
+            .setLabel("Stop Pooling License")
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji("🔒")
+        : new ButtonBuilder()
+            .setCustomId(`foundry_start_sharing_${userId}`)
+            .setLabel("Start Pooling License")
+            .setStyle(ButtonStyle.Success)
+            .setEmoji("🤝"),
+      new ButtonBuilder()
+        .setCustomId(`foundry_license_sharing_cancel_${userId}`)
+        .setLabel("Cancel")
+        .setStyle(ButtonStyle.Secondary)
+        .setEmoji("❌")
+    );
+
+    await interaction.editReply({
+      embeds: [embed],
+      components: [actionRow],
+    });
+  } catch (error) {
+    console.error("Error in handleLicenseSharing:", error);
+    await interaction.editReply({
+      content: `❌ Error managing license sharing: ${error.message}`,
+    });
+  }
+}
+
 function createRegistrationEmbed() {
   return new EmbedBuilder()
     .setColor("#0099ff")
     .setTitle("Register Your Foundry VTT Instance")
-    .setDescription("Create and manage a personal Foundry VTT instance.")
+    .setDescription(
+      "Create and manage your personal Foundry VTT instance with flexible license options."
+    )
     .addFields([
       {
-        name: "Instance Details",
+        name: "🚀 Instance Features",
         value:
-          "• Dedicated Foundry VTT server\n• Custom URL based on your username\n• Full admin access",
+          "• Dedicated Foundry VTT server\n• Custom URL based on your username\n• Full admin access\n• Real-time status monitoring",
       },
       {
-        name: "Costs",
+        name: "🔑 License Options",
         value:
-          "• Transparent usage tracking\n• Voluntary cost coverage via Ko-fi\n• No upfront fees or forced payments",
+          "• **BYOL (Bring Your Own License):** Use your own Foundry license\n• **Shared Instances:** Use community-shared licenses (schedule-based access)\n• **License Pooling:** Share your license with the community",
       },
       {
-        name: "Management",
+        name: "💰 Cost Model",
         value:
-          "• Control via Discord buttons\n• Real-time status updates\n• Retrieve admin key as needed",
+          "• Transparent usage tracking\n• Voluntary cost coverage via Ko-fi\n• No upfront fees or forced payments\n• Supporter role discounts available",
       },
     ])
-    .setFooter({ text: "Click Register to continue." })
+    .setFooter({
+      text: "💡 Tip: Licenses can be pooled, instances are shared. Click Register to get started!",
+    })
     .setTimestamp();
 }
 
@@ -1305,6 +1380,28 @@ async function handleCleanupMappings(interaction) {
     console.error("Cleanup mappings error:", error);
     await interaction.editReply({
       content: `❌ Error during cleanup: ${error.message}`,
+    });
+  }
+}
+
+async function handleTestLog(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  try {
+    const testMessage = interaction.options.getString("message");
+
+    // Send test message to console (which will be captured by our logging system)
+    console.log(`🧪 Test log message: ${testMessage}`);
+    console.warn(`🧪 Test warning message: ${testMessage}`);
+    console.error(`🧪 Test error message: ${testMessage}`);
+
+    await interaction.editReply({
+      content: `✅ Test log messages sent! Check the #foundry-bot-logs channel to see them.`,
+    });
+  } catch (error) {
+    console.error("Test log error:", error);
+    await interaction.editReply({
+      content: `❌ Error sending test log: ${error.message}`,
     });
   }
 }

@@ -142,12 +142,29 @@ export class LicenseScheduler {
     for (const license of activeLicenses) {
       if (license.licenseId === userOwnLicense) continue; // Already checked above
 
-      const availability = await this.checkBYOLAvailability(
+      // For pooled sessions, we consider a license available if:
+      // 1. It's active
+      // 2. It has no conflicting scheduled sessions (reservations)
+      // 3. Running BYOL instances are OK - they can be shut down
+
+      // Check for conflicting scheduled sessions only
+      const conflictingSessions =
+        await this.dynamoManager.getSessionsInTimeRange(startTime, endTime);
+      const hasConflictingSessions = conflictingSessions.some(
+        (session) =>
+          session.licenseId === license.licenseId &&
+          session.status !== "cancelled"
+      );
+
+      // Check for existing reservations
+      const reservations = await this.dynamoManager.getLicenseReservations(
         license.licenseId,
         startTime,
         endTime
       );
-      if (availability.available) {
+
+      // License is available if no conflicting sessions or reservations
+      if (!hasConflictingSessions && reservations.length === 0) {
         availableLicenses.push(license.licenseId);
       }
     }
@@ -212,7 +229,35 @@ export class LicenseScheduler {
 
     // Handle conflicts if necessary (shutdown conflicting instances)
     const conflictsResolved: string[] = [];
-    if (availability.conflictingInstances) {
+
+    // For pooled sessions, check if the assigned license has running BYOL instances that need to be shut down
+    if (request.licenseType === "pooled" && assignedLicenseId) {
+      const allInstances = await this.dynamoManager.getAllInstances();
+      const conflictingInstances = allInstances.filter(
+        (instance) =>
+          instance.licenseOwnerId === assignedLicenseId &&
+          (instance.status === "running" || instance.status === "starting")
+      );
+
+      for (const instance of conflictingInstances) {
+        try {
+          console.log(
+            `Shutting down BYOL instance for user ${instance.userId} to make license ${assignedLicenseId} available for pooled session ${sessionId}`
+          );
+          await this.shutdownInstanceForScheduledSession(
+            instance.userId,
+            sessionId
+          );
+          conflictsResolved.push(instance.userId);
+        } catch (error) {
+          console.error(
+            `Failed to shutdown instance for user ${instance.userId}:`,
+            error
+          );
+        }
+      }
+    } else if (availability.conflictingInstances) {
+      // Handle conflicts for BYOL sessions (existing logic)
       for (const userId of availability.conflictingInstances) {
         try {
           await this.shutdownInstanceForScheduledSession(userId, sessionId);
@@ -458,7 +503,7 @@ export class LicenseScheduler {
           const adminKey = pooledCredentials?.admin_key || "defaultadminkey";
 
           // Update the pooled instance's credentials with license owner's login
-          await this.secretsManager.storeCredentials(
+          const newSecretArn = await this.secretsManager.storeCredentials(
             userId,
             ownerCredentials.username,
             ownerCredentials.password,
@@ -468,9 +513,16 @@ export class LicenseScheduler {
           console.log(
             `Updated pooled instance ${userId} credentials to use license ${session.licenseId} from owner ${licenseOwnerId}`
           );
-        }
 
-        // Update the instance record to track the assigned license
+          // Update the instance record to track the assigned license AND the new secret ARN
+          await this.dynamoManager.updateInstance(userId, {
+            licenseOwnerId: session.licenseId,
+            secretArn: newSecretArn, // Update the secret ARN to point to the new credentials
+            updatedAt: Math.floor(Date.now() / 1000),
+          });
+        }
+      } else {
+        // Update the instance record to track the assigned license (for non-pooled or already configured instances)
         await this.dynamoManager.updateInstance(userId, {
           licenseOwnerId: session.licenseId,
           updatedAt: Math.floor(Date.now() / 1000),
@@ -482,7 +534,7 @@ export class LicenseScheduler {
         userId,
         instance.sanitizedUsername,
         instance.accessPointId,
-        instance.secretArn,
+        instance.secretArn || "", // Provide empty string if secretArn is undefined
         instance.s3BucketName,
         instance.s3AccessKeyId,
         instance.s3SecretAccessKey,
