@@ -252,6 +252,19 @@ export class DynamoDBManager {
     }
   }
 
+  async getAllLicenses(): Promise<LicensePool[]> {
+    try {
+      const command = new ScanCommand({
+        TableName: this.licensePoolTableName,
+      });
+      const response = await this.docClient.send(command);
+      return (response.Items as LicensePool[]) || [];
+    } catch (error) {
+      console.error("Error getting all licenses:", error);
+      return [];
+    }
+  }
+
   async updateLicensePool(
     licenseId: string,
     updates: Partial<LicensePool>
@@ -418,6 +431,24 @@ export class DynamoDBManager {
       return (response.Items as LicenseReservation[]) || [];
     } catch (error) {
       console.error("Error getting license reservations:", error);
+      return [];
+    }
+  }
+
+  async getAllActiveLicenseReservations(): Promise<LicenseReservation[]> {
+    try {
+      const command = new ScanCommand({
+        TableName: this.licenseReservationsTableName,
+        FilterExpression: "#status = :status",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":status": "active",
+        },
+      });
+      const response = await this.docClient.send(command);
+      return (response.Items as LicenseReservation[]) || [];
+    } catch (error) {
+      console.error("Error getting all active license reservations:", error);
       return [];
     }
   }

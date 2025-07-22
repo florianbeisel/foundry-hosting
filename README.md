@@ -1,130 +1,48 @@
 # Foundry VTT AWS Hosting Platform
 
-A comprehensive AWS-based hosting solution for Foundry Virtual Tabletop with Discord bot integration.
-
-## 🚀 Features
-
-### Core Infrastructure
-
-- **ECS Fargate** - Serverless container hosting with auto-scaling
-- **EFS Storage** - Persistent file storage for worlds and assets
-- **Application Load Balancer** - High availability with health checks
-- **Route53 DNS** - Custom subdomain routing (`username.domain.com`)
-- **DynamoDB** - Instance state and metadata storage
-- **Secrets Manager** - Encrypted credential storage
-
-### S3 Static Asset Integration ⭐ NEW
-
-- **Per-instance S3 buckets** - Dedicated storage for each user's static assets
-- **Direct S3 serving** - Images, audio, and assets served directly from S3 for better performance
-- **Automatic configuration** - FOUNDRY_AWS_CONFIG automatically generated per instance
-- **IAM user isolation** - Each instance gets dedicated IAM credentials with bucket-only access
-- **CORS configuration** - Properly configured for Foundry VTT access patterns
-
-### Discord Bot Management
-
-- **Slash commands** - Modern Discord interface for instance management
-- **Button interactions** - Easy start/stop/status controls
-- **Real-time monitoring** - Live status updates during startup
-- **Admin key management** - Secure delivery of Foundry admin credentials
-- **Channel management** - Dedicated command channels per user
-
-### Advanced Features
-
-- **Username-based URLs** - User-friendly subdomains instead of IDs
-- **Admin key persistence** - Reuses admin keys across instance recreations
-- **Bot restart sync** - Automatically syncs running instances on bot restart
-- **Complete cleanup** - Full resource cleanup on instance destruction
-- **Permanent registration** - Admin-posted registration messages
+A serverless AWS-based hosting solution for Foundry Virtual Tabletop with Discord bot integration for instance management.
 
 ## 🏗️ Architecture
 
+The platform consists of three main components:
+
+- **Infrastructure** (`index.ts`) - Pulumi-managed AWS resources
+- **Lambda API** (`lambda/`) - Serverless instance management functions
+- **Discord Bot** (`discord/`) - User interface for instance control
+
+### Core Infrastructure Components
+
+- **ECS Fargate** - Serverless container hosting for Foundry VTT instances
+- **EFS Storage** - Persistent file storage with per-user access points
+- **Application Load Balancer** - HTTPS termination and routing
+- **Route53 DNS** - Custom subdomain routing (`username.domain.com`)
+- **DynamoDB** - Instance state, scheduling, and usage tracking
+- **Secrets Manager** - Encrypted credential storage
+- **S3 Buckets** - Per-instance static asset storage with IAM isolation
+- **EventBridge** - Automated shutdown and session scheduling
+
+### Data Flow
+
 ```text
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Discord Bot   │    │   Lambda API     │    │   ECS Fargate   │
-│   (ECS Task)    ├────┤   (Instance Mgmt)├────┤  (Foundry VTT)  │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-         │                       │                       │
-         │              ┌────────────────┐              │
-         └──────────────┤   DynamoDB     ├──────────────┘
-                        │   (Instance    │
-                        │    State)      │
-                        └────────────────┘
-                                 │
-               ┌─────────────────┼─────────────────┐
-               │                 │                 │
-    ┌─────────────────┐ ┌────────────────┐ ┌─────────────────┐
-    │      EFS        │ │ Secrets Manager │ │   S3 Buckets   │
-    │  (Persistent    │ │  (Credentials)  │ │ (Static Assets) │
-    │   Storage)      │ └────────────────┘ └─────────────────┘
-    └─────────────────┘                            │
-               │                                   │
-    ┌─────────────────┐                   ┌─────────────────┐
-    │      ALB        │                   │   IAM Users     │
-    │  (Load Balance) │                   │ (S3 Access Keys)│
-    └─────────────────┘                   └─────────────────┘
-               │
-    ┌─────────────────┐
-    │    Route53      │
-    │  (DNS Records)  │
-    └─────────────────┘
+Discord Bot → Lambda API → AWS Services
+     ↓              ↓           ↓
+  User Commands  Instance   ECS/EFS/S3
+     ↓              ↓           ↓
+  Status Updates  State Mgmt  Resource Control
 ```
-
-## 📦 S3 Static Assets
-
-### How It Works
-
-Each Foundry VTT instance gets its own dedicated S3 bucket for serving static assets:
-
-1. **Bucket Creation** - Unique bucket per user: `foundry-{username}-{userid}`
-2. **IAM Isolation** - Dedicated IAM user with access only to their bucket
-3. **Auto-Configuration** - `FOUNDRY_AWS_CONFIG` environment variable automatically set
-4. **Public Read Access** - Bucket configured for public read access for asset serving
-5. **CORS Setup** - Proper CORS configuration for browser access
-
-### Performance Benefits
-
-- **Faster Loading** - Static assets served directly from S3 CDN
-- **Reduced Server Load** - Foundry server only handles dynamic content
-- **Global Distribution** - S3's global infrastructure for better performance
-- **Bandwidth Savings** - Assets don't consume Foundry container bandwidth
-
-### Automatic Configuration
-
-The Lambda function automatically configures each instance with:
-
-```json
-{
-  "buckets": ["foundry-username-12345678"],
-  "region": "us-east-1",
-  "credentials": {
-    "accessKeyId": "AKIA...",
-    "secretAccessKey": "..."
-  }
-}
-```
-
-This is passed to the Foundry Docker container via `FOUNDRY_AWS_CONFIG` environment variable.
-
-### Security Model
-
-- **Bucket Isolation** - Each user can only access their own bucket
-- **IAM Least Privilege** - Users can only perform necessary S3 operations
-- **Automatic Cleanup** - Buckets and IAM users deleted with instance destruction
-- **Public Assets Only** - Only static assets are in S3, worlds remain in EFS
 
 ## 🔧 Technical Stack
 
-- **Infrastructure**: AWS Pulumi (TypeScript)
-- **Compute**: ECS Fargate
+- **Infrastructure**: Pulumi (TypeScript)
+- **Compute**: ECS Fargate (ARM64 Graviton)
 - **Storage**: EFS (persistent) + S3 (static assets)
-- **Database**: DynamoDB
+- **Database**: DynamoDB (serverless)
 - **Security**: Secrets Manager + IAM
-- **Networking**: ALB + Route53
+- **Networking**: ALB + Route53 + VPC
 - **Discord**: Discord.js v14
 - **Runtime**: Node.js 18
 
-## 🚀 Getting Started
+## 🚀 Deployment
 
 ### Prerequisites
 
@@ -133,61 +51,68 @@ This is passed to the Foundry Docker container via `FOUNDRY_AWS_CONFIG` environm
 - Domain name hosted in Route53
 - Foundry VTT license
 
-### Deployment
+### Configuration
 
-1. **Configure Pulumi**:
+```bash
+# Configure Pulumi
+pulumi config set foundry-hosting:domainName your-domain.com
+pulumi config set foundry-hosting:route53HostedZoneId Z123456789
+pulumi config set discord:token --secret your-bot-token
+pulumi config set discord:clientId your-client-id
 
-   ```bash
-   pulumi config set foundry-hosting:domainName your-domain.com
-   pulumi config set foundry-hosting:route53HostedZoneId Z123456789
-   pulumi config set discord:token --secret your-bot-token
-   pulumi config set discord:clientId your-client-id
-   ```
-
-2. **Deploy Infrastructure**:
-
-   ```bash
-   pulumi up
-   ```
-
-3. **Deploy Discord Bot**:
-
-   ```bash
-   cd discord
-   npm run deploy
-   ```
-
-### Required IAM Permissions
-
-The Lambda function requires additional permissions for S3 and IAM management:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3:CreateBucket",
-        "s3:DeleteBucket",
-        "s3:PutBucketPolicy",
-        "s3:PutBucketCors",
-        "s3:PutBucketVersioning",
-        "s3:ListBucket",
-        "s3:DeleteObject",
-        "iam:CreateUser",
-        "iam:DeleteUser",
-        "iam:CreateAccessKey",
-        "iam:DeleteAccessKey",
-        "iam:PutUserPolicy",
-        "iam:DeleteUserPolicy",
-        "iam:ListAccessKeys"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
+# Optional: Ko-fi integration
+pulumi config set kofiUrl "https://ko-fi.com/yourusername"
+pulumi config set kofiVerificationToken --secret "your-kofi-webhook-token"
 ```
+
+### Deploy Infrastructure
+
+```bash
+pulumi up
+```
+
+### Deploy Discord Bot
+
+```bash
+cd discord
+yarn deploy
+```
+
+## 📊 Features
+
+### Instance Management
+
+- **Per-User Isolation** - Each user gets dedicated EFS access point and S3 bucket
+- **Username-based URLs** - Custom subdomains (`username.domain.com`)
+- **Admin Key Persistence** - Reuses admin keys across instance recreations
+- **Auto-shutdown** - Configurable idle timeout via EventBridge
+- **Session Scheduling** - Pre-scheduled instance startup
+
+### S3 Static Asset Integration
+
+- **Per-instance S3 buckets** - Dedicated storage for each user's static assets
+- **Direct S3 serving** - Images, audio, and assets served directly from S3
+- **Automatic configuration** - `FOUNDRY_AWS_CONFIG` generated per instance
+- **IAM user isolation** - Each instance gets dedicated IAM credentials
+- **CORS configuration** - Properly configured for Foundry VTT access patterns
+
+### Cost Tracking & Ko-fi Integration
+
+- **Usage Tracking** - Per-user monthly hour and cost tracking
+- **Voluntary Donations** - Optional Ko-fi integration for cost coverage
+- **Real-time Cost Display** - Live cost information in Discord status messages
+- **Donation Buttons** - One-click Ko-fi donation links with pre-filled user ID
+- **Coverage Analytics** - Admin dashboard shows donation coverage statistics
+- **Monthly Reset** - Clean slate each month for usage and donations
+
+### Discord Bot Features
+
+- **Slash Commands** - Modern Discord interface for instance management
+- **Button Interactions** - Easy start/stop/status controls
+- **Real-time Monitoring** - Live status updates during startup
+- **Admin Key Management** - Secure delivery of Foundry admin credentials
+- **Channel Management** - Dedicated command channels per user
+- **Bot Restart Sync** - Automatically syncs running instances on bot restart
 
 ## 📖 Usage
 

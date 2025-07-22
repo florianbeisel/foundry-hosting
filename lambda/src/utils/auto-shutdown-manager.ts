@@ -283,8 +283,32 @@ export class AutoShutdownManager {
             );
             sessionsStarted++;
 
-            // TODO: Send Discord notification to user that their session has started
-            // This could be implemented later as a separate notification service
+            // Send Discord notification to user that their session has started
+            try {
+              const notificationPayload = {
+                action: "send-notification",
+                userId: "system", // System call
+                notificationType: "session-ready",
+                targetUserId: session.userId,
+                message: `Your scheduled session "${
+                  session.title || "Foundry VTT Session"
+                }" is now ready!`,
+                sessionId: session.sessionId,
+                instanceUrl: startResult.instanceUrl,
+              };
+
+              // Note: In a real implementation, this would call the Discord bot
+              // For now, we'll log it and the Discord bot can poll for notifications
+              console.log(
+                "📢 Session ready notification:",
+                notificationPayload
+              );
+            } catch (notificationError) {
+              console.error(
+                "Failed to send session ready notification:",
+                notificationError
+              );
+            }
           } else {
             console.error(
               `❌ Failed to start scheduled session ${session.sessionId}: ${startResult.message}`

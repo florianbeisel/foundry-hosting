@@ -128,6 +128,103 @@ client.registrationStats = new Map(); // channelId -> statsMessageId
 // Map of admin status channels to their status message IDs
 client.adminStatusMapping = new Map(); // channelId -> adminStatusMessageId
 
+// Map of user status messages to their message IDs
+client.userStatusMessages = new Map(); // userId -> messageId
+
+// Store last known status for each user to avoid unnecessary updates
+const lastKnownStatus = new Map(); // userId -> { status, updatedAt, url }
+
+// Helper function to build status embed for message updates
+async function buildStatusEmbed(status) {
+  const statusEmoji = {
+    running: "🟢",
+    starting: "🟡",
+    stopping: "🟠",
+    stopped: "🔴",
+    created: "⚪",
+    unknown: "❔",
+  };
+
+  // Get monthly cost data
+  let costData = null;
+  try {
+    const costResult = await invokeLambda({
+      action: "get-user-costs",
+      userId: status.userId,
+    });
+    costData = costResult;
+  } catch (error) {
+    console.log("Could not fetch cost data for status embed:", error);
+  }
+
+  // Get license owner info for gratitude display on pooled instances
+  let licenseOwnerInfo = null;
+  if (status.licenseType === "pooled" && status.licenseOwnerId) {
+    try {
+      const adminResult = await invokeLambda({
+        action: "admin-overview",
+        userId: status.userId,
+      });
+
+      if (adminResult.licenses && adminResult.licenses.pools) {
+        const licensePool = adminResult.licenses.pools.find(
+          (pool) => pool.licenseId === status.licenseOwnerId
+        );
+        if (licensePool) {
+          licenseOwnerInfo = licensePool.ownerUsername;
+        }
+      }
+    } catch (error) {
+      console.log("Could not fetch license owner info for status embed");
+    }
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(status.status === "starting" ? "#ffff00" : "#888888")
+    .setTitle(`${statusEmoji[status.status]} Instance Status`)
+    .setDescription(`Current status: **${status.status}**`)
+    .addFields([
+      {
+        name: "Last Updated",
+        value: `<t:${status.updatedAt}:R>`,
+        inline: true,
+      },
+      ...(costData
+        ? [
+            {
+              name: "💰 This Month",
+              value: `${costData.hoursUsed.toFixed(
+                1
+              )}h = $${costData.totalCost.toFixed(2)}${
+                costData.uncoveredCost > 0
+                  ? ` (💸$${costData.uncoveredCost.toFixed(2)} uncovered)`
+                  : " ✅"
+              }`,
+              inline: true,
+            },
+          ]
+        : []),
+      ...(licenseOwnerInfo
+        ? [
+            {
+              name: "🤝 License Shared By",
+              value: `Thanks to **${licenseOwnerInfo}** for sharing their license!`,
+              inline: false,
+            },
+          ]
+        : []),
+    ])
+    .setTimestamp();
+
+  if (status.status === "starting") {
+    embed.addFields([
+      { name: "Progress", value: "Starting up Foundry VTT...", inline: true },
+    ]);
+  }
+
+  return embed;
+}
+
 // Dynamically import all command modules
 const fs = require("node:fs");
 const path = require("node:path");
@@ -239,6 +336,34 @@ function getStatusEmoji(status) {
     unknown: "❔",
   };
   return statusEmojis[status] || "❔";
+}
+
+/**
+ * Create Ko-fi donation button row for supporting the server
+ * @param {string} userId - Discord user ID
+ * @param {number} suggestedAmount - Optional suggested donation amount
+ * @param {string} message - Custom message for Ko-fi
+ */
+function createKofiSupportButton(
+  userId,
+  suggestedAmount = null,
+  message = null
+) {
+  if (!process.env.KOFI_URL) return null;
+
+  const defaultMessage = `Discord: ${userId} - Thanks for the awesome Foundry hosting service!`;
+  const kofiMessage = message || defaultMessage;
+  const buttonLabel = suggestedAmount
+    ? `☕ Cover $${suggestedAmount.toFixed(2)} on Ko-fi`
+    : "☕ Support the Server on Ko-fi";
+
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setURL(process.env.KOFI_URL)
+      .setLabel(buttonLabel)
+      .setStyle(ButtonStyle.Link)
+      .setEmoji("💖")
+  );
 }
 
 // Helper function to find existing command channel for a user
@@ -506,6 +631,7 @@ async function deleteUserCommandChannel(guild, userId) {
         await channel.delete();
       }
       client.userChannels.delete(userId);
+      client.userStatusMessages.delete(userId);
     } catch (error) {
       console.error("Error deleting user channel:", error);
     }
@@ -571,7 +697,7 @@ function startStatusMonitoring(userId, channelId) {
 
       stopStatusMonitoring(userId);
     }
-  }, 20000); // Check every 20 seconds (optimized from 15s to reduce Lambda invocations)
+  }, 10000); // Check every 10 seconds for faster detection
 
   client.statusMonitors.set(userId, monitorInterval);
 }
@@ -593,6 +719,18 @@ async function sendStatusUpdate(channel, status) {
     created: "⚪",
     unknown: "❔",
   };
+
+  // Get monthly cost data
+  let costData = null;
+  try {
+    const costResult = await invokeLambda({
+      action: "get-user-costs",
+      userId: status.userId,
+    });
+    costData = costResult;
+  } catch (error) {
+    console.log("Could not fetch cost data for status update:", error);
+  }
 
   // Get license owner info for gratitude display on pooled instances
   let licenseOwnerInfo = null;
@@ -626,6 +764,21 @@ async function sendStatusUpdate(channel, status) {
         value: `<t:${status.updatedAt}:R>`,
         inline: true,
       },
+      ...(costData
+        ? [
+            {
+              name: "💰 This Month",
+              value: `${costData.hoursUsed.toFixed(
+                1
+              )}h = $${costData.totalCost.toFixed(2)}${
+                costData.uncoveredCost > 0
+                  ? ` (💸$${costData.uncoveredCost.toFixed(2)} uncovered)`
+                  : " ✅"
+              }`,
+              inline: true,
+            },
+          ]
+        : []),
       ...(licenseOwnerInfo
         ? [
             {
@@ -644,10 +797,38 @@ async function sendStatusUpdate(channel, status) {
     ]);
   }
 
-  await channel.send({ embeds: [embed] });
+  // Add Ko-fi donation button if user has uncovered costs
+  const components = [];
+  if (costData && costData.uncoveredCost > 0) {
+    const kofiRow = createKofiSupportButton(
+      status.userId,
+      costData.uncoveredCost
+    );
+    if (kofiRow) components.push(kofiRow);
+  }
+
+  const sentMessage = await channel.send({
+    embeds: [embed],
+    components: components,
+  });
+
+  // Store the message ID for future updates
+  client.userStatusMessages.set(status.userId, sentMessage.id);
 }
 
 async function sendInstanceControlPanel(channel, userId, status) {
+  // Get monthly cost data
+  let costData = null;
+  try {
+    const costResult = await invokeLambda({
+      action: "get-user-costs",
+      userId: userId,
+    });
+    costData = costResult;
+  } catch (error) {
+    console.log("Could not fetch cost data:", error);
+  }
+
   // Get license owner info for gratitude display
   let licenseOwnerInfo = null;
   if (status.licenseType === "pooled" && status.licenseOwnerId) {
@@ -678,6 +859,41 @@ async function sendInstanceControlPanel(channel, userId, status) {
       { name: "Status", value: "🟢 Running", inline: true },
       { name: "URL", value: status.url || "URL not available", inline: false },
       { name: "Started", value: `<t:${status.updatedAt}:R>`, inline: true },
+      ...(costData
+        ? [
+            {
+              name: "💰 This Month's Usage",
+              value: `**${costData.hoursUsed.toFixed(
+                1
+              )}h** = $${costData.totalCost.toFixed(2)}`,
+              inline: true,
+            },
+            {
+              name:
+                costData.uncoveredCost > 0
+                  ? "💸 Uncovered Cost"
+                  : "✅ Fully Covered",
+              value:
+                costData.uncoveredCost > 0
+                  ? `$${costData.uncoveredCost.toFixed(2)}`
+                  : "All costs covered! 🎉",
+              inline: true,
+            },
+            ...(costData.donationsReceived > 0
+              ? [
+                  {
+                    name: "☕ Donations Received",
+                    value: `$${costData.donationsReceived.toFixed(2)}${
+                      costData.lastDonorName
+                        ? ` (Latest: ${costData.lastDonorName})`
+                        : ""
+                    }`,
+                    inline: true,
+                  },
+                ]
+              : []),
+          ]
+        : []),
       ...(licenseOwnerInfo
         ? [
             {
@@ -731,11 +947,33 @@ async function sendInstanceControlPanel(channel, userId, status) {
       .setEmoji("💀")
   );
 
-  await channel.send({
+  // Add Ko-fi donation button if there are uncovered costs
+  const components = [actionRow];
+  if (
+    costData &&
+    costData.uncoveredCost > 0 &&
+    process.env.KOFI_URL &&
+    process.env.KOFI_URL.trim() !== ""
+  ) {
+    const suggestedAmount = Math.min(costData.uncoveredCost, 5).toFixed(2);
+    const kofiRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setURL(process.env.KOFI_URL)
+        .setLabel(`☕ Cover $${suggestedAmount} on Ko-fi`)
+        .setStyle(ButtonStyle.Link)
+        .setEmoji("💖")
+    );
+    components.push(kofiRow);
+  }
+
+  const sentMessage = await channel.send({
     embeds: [embed],
-    components: [actionRow],
+    components: components,
     content: `<@${userId}> Your Foundry VTT instance is ready!`,
   });
+
+  // Store the message ID for future updates
+  client.userStatusMessages.set(userId, sentMessage.id);
 
   // Refresh stats after state change
   await refreshRegistrationStats();
@@ -782,6 +1020,9 @@ async function syncAllInstances() {
 
           // Clear ALL messages from the command channel for visibility
           await clearChannelMessages(channel);
+
+          // Clear stored message ID since we cleared the channel
+          client.userStatusMessages.delete(instance.userId);
 
           // Get license owner info for pooled instances
           let licenseOwnerInfo = null;
@@ -1024,9 +1265,45 @@ async function syncAllInstances() {
             }
           }
 
+          // Add Ko-fi button if user has uncovered costs
+          let kofiRow = null;
+          try {
+            const costResult = await invokeLambda({
+              action: "get-user-costs",
+              userId: instance.userId,
+            });
+            if (
+              costResult &&
+              costResult.uncoveredCost > 0 &&
+              process.env.KOFI_URL &&
+              process.env.KOFI_URL.trim() !== ""
+            ) {
+              const suggestedAmount = Math.min(
+                costResult.uncoveredCost,
+                5
+              ).toFixed(2);
+              kofiRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                  .setURL(process.env.KOFI_URL)
+                  .setLabel(`☕ Cover $${suggestedAmount} on Ko-fi`)
+                  .setStyle(ButtonStyle.Link)
+                  .setEmoji("💖")
+              );
+            }
+          } catch (error) {
+            console.log(
+              "Could not fetch cost data for sync Ko-fi button:",
+              error
+            );
+          }
+
+          const components = [actionRow];
+          if (kofiRow) components.push(kofiRow);
+          if (destroyRow) components.push(destroyRow);
+
           await channel.send({
             embeds: [welcomeEmbed],
-            components: destroyRow ? [actionRow, destroyRow] : [actionRow],
+            components: components,
           });
 
           // Post current status with consistent controls
@@ -1080,14 +1357,41 @@ client.once("ready", async () => {
   // Restore admin status mapping
   if (botConfigTableName) {
     const adminMap = await loadAdminStatusMappingFromDB();
+    console.log("🔍 Admin status mapping from DB:", adminMap);
     if (adminMap && adminMap.channelId && adminMap.messageId) {
       client.adminStatusMapping.set(adminMap.channelId, adminMap.messageId);
-      console.log("✅ Restored admin status mapping from DynamoDB");
+      console.log(
+        `✅ Restored admin status mapping: ${adminMap.channelId} -> ${adminMap.messageId}`
+      );
+    } else {
+      console.log("⚠️ No admin status mapping found in DynamoDB");
     }
+  } else {
+    console.log(
+      "⚠️ BOT_CONFIG_TABLE_NAME not set, cannot restore admin status mapping"
+    );
   }
 
   // Sync all running instances
   await syncAllInstances();
+
+  // Refresh statistics and admin status after startup
+  try {
+    await refreshRegistrationStats();
+    console.log("✅ Refreshed registration statistics on startup");
+  } catch (error) {
+    console.log(
+      "⚠️ Failed to refresh registration stats on startup:",
+      error.message
+    );
+  }
+
+  try {
+    await refreshAdminStatus();
+    console.log("✅ Refreshed admin status dashboard on startup");
+  } catch (error) {
+    console.log("⚠️ Failed to refresh admin status on startup:", error.message);
+  }
 });
 
 // Error handling
@@ -1186,12 +1490,15 @@ async function handleButtonInteraction(interaction) {
     // Format: foundry_action_confirm_userId or special actions
     if (
       subAction === "reregister" ||
-      subAction === "stop" ||
       subAction === "use" ||
       subAction === "create" ||
       subAction === "destroy"
     ) {
-      // Format: foundry_reregister_byol_userId, foundry_stop_sharing_userId, foundry_use_pooled_userId, foundry_create_pooled_userId
+      // Format: foundry_reregister_byol_userId, foundry_use_pooled_userId, foundry_create_pooled_userId
+      userId = parts[3];
+      confirmAction = `${subAction}_${parts[2]}`;
+    } else if (subAction === "stop") {
+      // Format: foundry_stop_restart_userId, foundry_stop_cancel_userId
       userId = parts[3];
       confirmAction = `${subAction}_${parts[2]}`;
     } else {
@@ -1202,6 +1509,10 @@ async function handleButtonInteraction(interaction) {
     // Format: foundry_action_part1_part2_userId (5-part special actions)
     if (subAction === "destroy") {
       // Format: foundry_destroy_keep_sharing_userId, foundry_destroy_stop_sharing_userId
+      userId = parts[4];
+      confirmAction = `${subAction}_${parts[2]}_${parts[3]}`;
+    } else if (subAction === "stop") {
+      // Format: foundry_stop_cancel_session_userId
       userId = parts[4];
       confirmAction = `${subAction}_${parts[2]}_${parts[3]}`;
     } else {
@@ -1316,6 +1627,45 @@ async function handleButtonInteraction(interaction) {
     }
   }
 
+  if (confirmAction === "stop_cancel_session") {
+    try {
+      await handleStopCancelSession(interaction, userId);
+      return;
+    } catch (error) {
+      console.error("Stop cancel session error:", error);
+      return await interaction.reply({
+        content: `❌ Failed to stop and cancel session: ${error.message}`,
+        ephemeral: true,
+      });
+    }
+  }
+
+  if (confirmAction === "stop_restart") {
+    try {
+      await handleStopRestart(interaction, userId);
+      return;
+    } catch (error) {
+      console.error("Stop restart error:", error);
+      return await interaction.reply({
+        content: `❌ Failed to stop and restart: ${error.message}`,
+        ephemeral: true,
+      });
+    }
+  }
+
+  if (confirmAction === "stop_cancel") {
+    try {
+      await handleStopCancel(interaction, userId);
+      return;
+    } catch (error) {
+      console.error("Stop cancel error:", error);
+      return await interaction.reply({
+        content: `❌ Failed to cancel stop: ${error.message}`,
+        ephemeral: true,
+      });
+    }
+  }
+
   // Check if user can interact with this button (skip admin check for DMs)
   if (
     userId !== interaction.user.id &&
@@ -1345,10 +1695,14 @@ async function handleButtonInteraction(interaction) {
         await handleAdminKeyButton(interaction, userId);
         break;
       case "destroy":
-        if (confirmAction === "confirm") {
+        if (confirmAction === "destroy_confirm") {
           await handleDestroyConfirmButton(interaction, userId);
-        } else if (confirmAction === "cancel") {
+        } else if (confirmAction === "destroy_cancel") {
           await handleDestroyCancelButton(interaction, userId);
+        } else if (confirmAction === "destroy_keep_sharing") {
+          await handleDestroyKeepSharing(interaction, userId);
+        } else if (confirmAction === "destroy_stop_sharing") {
+          await handleDestroyStopSharing(interaction, userId);
         } else {
           await handleDestroyButton(interaction, userId);
         }
@@ -1730,6 +2084,10 @@ async function handleAdminButtonInteraction(interaction) {
       new ButtonBuilder()
         .setCustomId("admin_system_maintenance")
         .setLabel("🔧 Maintenance Mode")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("admin_maintenance_reset")
+        .setLabel("🔄 Reset Sessions & Re-activate Licenses")
         .setStyle(ButtonStyle.Secondary)
     );
 
@@ -1891,6 +2249,54 @@ async function handleAdminButtonInteraction(interaction) {
       console.error("Admin system maintenance error:", error);
       await interaction.editReply({
         content: `❌ Error activating maintenance mode: ${error.message}`,
+      });
+    }
+  } else if (customId === "admin_maintenance_reset") {
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      const command = new InvokeCommand({
+        FunctionName: process.env.LAMBDA_FUNCTION_NAME,
+        Payload: JSON.stringify({
+          action: "admin-maintenance-reset",
+          userId: interaction.user.id,
+          forceReason: "Admin maintenance reset - sessions and licenses",
+        }),
+      });
+
+      const result = await lambda.send(command);
+      const response = JSON.parse(new TextDecoder().decode(result.Payload));
+
+      if (response.statusCode !== 200) {
+        throw new Error(JSON.parse(response.body).error);
+      }
+
+      const data = JSON.parse(response.body);
+
+      const resultMessage = [
+        `🔄 **Maintenance Reset Completed**`,
+        `**Sessions Cancelled:** ${data.cancelledCount}/${data.totalSessions}`,
+        `**License Reservations Cleared:** ${data.reservationsCancelled || 0}`,
+        `**License Pools Reset & Re-activated:** ${data.resetCount}/${data.totalLicensePools}`,
+        data.errors && data.errors.length > 0
+          ? `**Errors:** ${data.errors.join(", ")}`
+          : "",
+        ``,
+        `✅ **All scheduled sessions cancelled**`,
+        `✅ **All license reservations cleared**`,
+        `✅ **License pools reset and re-activated for new sessions**`,
+        `⚠️ **Instances remain running - use "Shutdown All Instances" if needed**`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      await interaction.editReply({
+        content: resultMessage,
+      });
+    } catch (error) {
+      console.error("Admin maintenance reset error:", error);
+      await interaction.editReply({
+        content: `❌ Error during maintenance reset: ${error.message}`,
       });
     }
   } else {
@@ -2097,14 +2503,19 @@ async function handleCredentialsModal(interaction) {
         .setEmoji("💀")
     );
 
+    // Add optional Ko-fi support button
+    const kofiRow = createKofiSupportButton(userId);
+    const components = [actionRow, destroyRow];
+    if (kofiRow) components.push(kofiRow);
+
     await user.send({
       embeds: [successEmbed, adminKeyEmbed],
-      components: [actionRow, destroyRow],
+      components: components,
     });
     await channel.send({
       content: `<@${userId}> Instance ready.`,
       embeds: [successEmbed],
-      components: [actionRow, destroyRow],
+      components: components,
     });
 
     // Update the ephemeral response with success message
@@ -2446,10 +2857,8 @@ async function handleStartButton(interaction, userId) {
         }
       );
 
-      // Wait 30 seconds before starting status monitoring to give the instance time to initialize
-      setTimeout(() => {
-        startStatusMonitoring(userId, channelId);
-      }, 30000);
+      // Start status monitoring immediately to catch when instance becomes ready
+      startStatusMonitoring(userId, channelId);
     } catch (error) {
       console.error("Failed to send message to any channel:", error);
       await interaction.editReply({
@@ -2469,6 +2878,87 @@ async function handleStartButton(interaction, userId) {
 }
 
 async function handleStopButton(interaction, userId) {
+  // First check if this instance is running a scheduled session
+  const statusResult = await invokeLambda({
+    action: "status",
+    userId: userId,
+  });
+
+  // If this is a scheduled session, show confirmation dialog
+  if (statusResult.linkedSessionId && statusResult.status === "running") {
+    // Get session details
+    const sessionResult = await invokeLambda({
+      action: "list-sessions",
+      userId: userId,
+    });
+
+    const session = sessionResult.sessions?.find(
+      (s) => s.sessionId === statusResult.linkedSessionId
+    );
+
+    if (session && session.status === "active") {
+      // Show confirmation dialog for scheduled session
+      const confirmEmbed = new EmbedBuilder()
+        .setColor("#ff8800")
+        .setTitle("⚠️ Scheduled Session Active")
+        .setDescription(
+          `You're trying to stop an instance that's running a **scheduled session**.`
+        )
+        .addFields([
+          {
+            name: "Session Details",
+            value: [
+              `**Title:** ${session.title || "Foundry VTT Session"}`,
+              `**Start:** <t:${session.startTime}:F>`,
+              `**End:** <t:${session.endTime}:F>`,
+              `**License Type:** ${session.licenseType?.toUpperCase()}`,
+            ].join("\n"),
+            inline: true,
+          },
+          {
+            name: "What happens if you stop?",
+            value: [
+              "• Your session will be cancelled",
+              "• The license will be freed up",
+              "• Other users can use the license",
+              "• You'll need to schedule a new session",
+            ].join("\n"),
+            inline: true,
+          },
+        ])
+        .setTimestamp();
+
+      const actionRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`foundry_stop_cancel_session_${userId}`)
+          .setLabel("Stop & Cancel Session")
+          .setStyle(ButtonStyle.Danger)
+          .setEmoji("❌"),
+        new ButtonBuilder()
+          .setCustomId(`foundry_stop_restart_${userId}`)
+          .setLabel("Stop & Restart Instance")
+          .setStyle(ButtonStyle.Primary)
+          .setEmoji("🔄"),
+        new ButtonBuilder()
+          .setCustomId(`foundry_stop_cancel_${userId}`)
+          .setLabel("Cancel")
+          .setStyle(ButtonStyle.Secondary)
+          .setEmoji("🚫")
+      );
+
+      await interaction.editReply({
+        embeds: [confirmEmbed],
+        components: [actionRow],
+      });
+      return;
+    }
+  }
+
+  // Regular stop (no scheduled session or session not active)
+  await performStopInstance(interaction, userId);
+}
+
+async function performStopInstance(interaction, userId) {
   stopStatusMonitoring(userId);
 
   const result = await invokeLambda({
@@ -2517,13 +3007,283 @@ async function handleStatusButton(interaction, userId) {
     userId: userId,
   });
 
+  // Try to update existing message, or send new one if not found
+  const existingMessageId = client.userStatusMessages.get(userId);
+  let messageUpdated = false;
+
+  if (existingMessageId) {
+    try {
+      const existingMessage = await interaction.channel.messages.fetch(
+        existingMessageId
+      );
+
+      if (result.status === "running") {
+        // For running instances, we need to send a new message since control panel has buttons
+        await existingMessage.delete();
+        await sendInstanceControlPanel(interaction.channel, userId, result);
+      } else {
+        // For non-running instances, we can update the existing message
+        const statusEmbed = await buildStatusEmbed(result);
+        await existingMessage.edit({ embeds: [statusEmbed] });
+        messageUpdated = true;
+      }
+    } catch (error) {
+      console.log(
+        `Could not update existing message for ${userId}, sending new one:`,
+        error.message
+      );
+      // Message not found or can't be edited, send new one
+      if (result.status === "running") {
+        await sendInstanceControlPanel(interaction.channel, userId, result);
+      } else {
+        await sendStatusUpdate(interaction.channel, result);
+      }
+    }
+  } else {
+    // No existing message, send new one
+    if (result.status === "running") {
+      await sendInstanceControlPanel(interaction.channel, userId, result);
+    } else {
+      await sendStatusUpdate(interaction.channel, result);
+    }
+  }
+
+  await interaction.editReply({ content: "🔄 Status refreshed above." });
+}
+
+async function handleStopCancelSession(interaction, userId) {
+  await interaction.deferUpdate();
+
+  try {
+    // First get the current status to find the linked session
+    const statusResult = await invokeLambda({
+      action: "status",
+      userId: userId,
+    });
+
+    if (!statusResult.linkedSessionId) {
+      throw new Error("No linked session found");
+    }
+
+    // Cancel the session first
+    const cancelResult = await invokeLambda({
+      action: "cancel-session",
+      userId: userId,
+      sessionId: statusResult.linkedSessionId,
+    });
+
+    // Then stop the instance
+    const stopResult = await invokeLambda({
+      action: "stop",
+      userId: userId,
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor("#ff0000")
+      .setTitle("❌ Session Cancelled & Instance Stopped")
+      .setDescription(
+        "Your scheduled session has been cancelled and the instance stopped."
+      )
+      .addFields([
+        { name: "Session Status", value: "❌ Cancelled", inline: true },
+        { name: "Instance Status", value: "🔴 Stopped", inline: true },
+        { name: "License", value: "🔄 Freed up for others", inline: true },
+        {
+          name: "What's Next?",
+          value:
+            "You can schedule a new session or start your instance on-demand (BYOL only).",
+          inline: false,
+        },
+      ])
+      .setTimestamp();
+
+    // Create action buttons based on license type
+    const actionRow = new ActionRowBuilder();
+
+    if (statusResult.licenseType === "byol") {
+      // BYOL users can start on-demand or schedule
+      actionRow.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`foundry_start_${userId}`)
+          .setLabel("Start Instance")
+          .setStyle(ButtonStyle.Success)
+          .setEmoji("🚀"),
+        new ButtonBuilder()
+          .setCustomId(`foundry_schedule_${userId}`)
+          .setLabel("Schedule Session")
+          .setStyle(ButtonStyle.Primary)
+          .setEmoji("📅")
+      );
+    } else {
+      // Pooled users can only schedule
+      actionRow.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`foundry_schedule_${userId}`)
+          .setLabel("Schedule Session")
+          .setStyle(ButtonStyle.Primary)
+          .setEmoji("📅")
+      );
+    }
+
+    actionRow.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`foundry_status_${userId}`)
+        .setLabel("Refresh Status")
+        .setStyle(ButtonStyle.Secondary)
+        .setEmoji("🔄"),
+      new ButtonBuilder()
+        .setCustomId(`foundry_destroy_${userId}`)
+        .setLabel("Destroy")
+        .setStyle(ButtonStyle.Danger)
+        .setEmoji("💀")
+    );
+
+    await interaction.editReply({ embeds: [embed], components: [actionRow] });
+  } catch (error) {
+    console.error("Stop cancel session error:", error);
+
+    const errorEmbed = new EmbedBuilder()
+      .setColor("#ff0000")
+      .setTitle("❌ Error")
+      .setDescription(
+        `Failed to cancel session and stop instance: ${error.message}`
+      )
+      .setTimestamp();
+
+    await interaction.editReply({ embeds: [errorEmbed] });
+  }
+}
+
+async function handleStopRestart(interaction, userId) {
+  await interaction.deferUpdate();
+
+  try {
+    // First get the current status to check license type
+    const statusResult = await invokeLambda({
+      action: "status",
+      userId: userId,
+    });
+
+    // Check if this is a pooled license (which can't restart on-demand)
+    if (statusResult.licenseType === "pooled") {
+      const errorEmbed = new EmbedBuilder()
+        .setColor("#ff0000")
+        .setTitle("❌ Cannot Restart Pooled Instance")
+        .setDescription(
+          "Pooled license instances cannot be restarted on-demand. You must schedule a new session."
+        )
+        .addFields([
+          {
+            name: "What you can do:",
+            value:
+              "• Schedule a new session\n• Wait for your current session to end\n• Contact an admin if you need immediate access",
+            inline: false,
+          },
+        ])
+        .setTimestamp();
+
+      const actionRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`foundry_schedule_${userId}`)
+          .setLabel("Schedule New Session")
+          .setStyle(ButtonStyle.Primary)
+          .setEmoji("📅"),
+        new ButtonBuilder()
+          .setCustomId(`foundry_status_${userId}`)
+          .setLabel("Refresh Status")
+          .setStyle(ButtonStyle.Secondary)
+          .setEmoji("🔄")
+      );
+
+      await interaction.editReply({
+        embeds: [errorEmbed],
+        components: [actionRow],
+      });
+      return;
+    }
+
+    // For BYOL instances, stop and then start
+    const stopResult = await invokeLambda({
+      action: "stop",
+      userId: userId,
+    });
+
+    // Wait a moment for the stop to complete
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    const startResult = await invokeLambda({
+      action: "start",
+      userId: userId,
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor("#00ff00")
+      .setTitle("🔄 Instance Restarted")
+      .setDescription(
+        "Your instance has been stopped and restarted successfully."
+      )
+      .addFields([
+        { name: "Status", value: "🟢 Running", inline: true },
+        { name: "License Type", value: "BYOL (On-Demand)", inline: true },
+        { name: "Auto-Shutdown", value: "6 hours from now", inline: true },
+      ])
+      .setTimestamp();
+
+    const actionRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`foundry_stop_${userId}`)
+        .setLabel("Stop Instance")
+        .setStyle(ButtonStyle.Danger)
+        .setEmoji("⏹️"),
+      new ButtonBuilder()
+        .setCustomId(`foundry_status_${userId}`)
+        .setLabel("Refresh Status")
+        .setStyle(ButtonStyle.Secondary)
+        .setEmoji("🔄"),
+      new ButtonBuilder()
+        .setCustomId(`foundry_adminkey_${userId}`)
+        .setLabel("Get Admin Key")
+        .setStyle(ButtonStyle.Secondary)
+        .setEmoji("🔑"),
+      new ButtonBuilder()
+        .setCustomId(`foundry_destroy_${userId}`)
+        .setLabel("Destroy")
+        .setStyle(ButtonStyle.Danger)
+        .setEmoji("💀")
+    );
+
+    await interaction.editReply({ embeds: [embed], components: [actionRow] });
+  } catch (error) {
+    console.error("Stop restart error:", error);
+
+    const errorEmbed = new EmbedBuilder()
+      .setColor("#ff0000")
+      .setTitle("❌ Error")
+      .setDescription(`Failed to restart instance: ${error.message}`)
+      .setTimestamp();
+
+    await interaction.editReply({ embeds: [errorEmbed] });
+  }
+}
+
+async function handleStopCancel(interaction, userId) {
+  await interaction.deferUpdate();
+
+  // Just show the current status without doing anything
+  const result = await invokeLambda({
+    action: "status",
+    userId: userId,
+  });
+
   if (result.status === "running") {
     await sendInstanceControlPanel(interaction.channel, userId, result);
   } else {
     await sendStatusUpdate(interaction.channel, result);
   }
 
-  await interaction.editReply({ content: "🔄 Status refreshed above." });
+  await interaction.editReply({
+    content: "✅ Stop cancelled. Current status shown above.",
+  });
 }
 
 async function handleAdminKeyButton(interaction, userId) {
@@ -4176,6 +4936,18 @@ async function buildStatsEmbed() {
       .setDescription("Unable to retrieve statistics at this time.");
   }
 
+  // Get cost data for all users
+  let allCosts = null;
+  try {
+    const costResult = await invokeLambda({
+      action: "get-all-costs",
+      userId: "system",
+    });
+    allCosts = costResult;
+  } catch (error) {
+    console.log("Could not fetch cost data for stats:", error);
+  }
+
   const COST_PER_HOUR = parseFloat(
     process.env.INSTANCE_COST_PER_HOUR || "0.10"
   );
@@ -4188,6 +4960,18 @@ async function buildStatsEmbed() {
           720
         ).toFixed(2)}`;
 
+  const costCoverageData = allCosts
+    ? [
+        `**Donations:** $${allCosts.totalDonations.toFixed(2)}`,
+        `**Uncovered:** $${allCosts.totalUncovered.toFixed(2)}`,
+        `**Coverage:** ${
+          allCosts.totalCosts > 0
+            ? Math.round((allCosts.totalDonations / allCosts.totalCosts) * 100)
+            : 0
+        }%`,
+      ]
+    : [];
+
   return new EmbedBuilder()
     .setColor("#0099ff")
     .setTitle("Instance Statistics")
@@ -4198,6 +4982,7 @@ async function buildStatsEmbed() {
         `**BYOL:** ${summary.byolInstances}`,
         `**Pooled:** ${summary.pooledInstances}`,
         costLine,
+        ...costCoverageData,
       ].join(" | ")
     )
     .setTimestamp();
@@ -4245,6 +5030,57 @@ async function refreshRegistrationStats() {
   }
 }
 
+async function refreshAdminStatus() {
+  console.log("🔄 refreshAdminStatus called");
+  console.log(`📊 Admin status mappings: ${client.adminStatusMapping.size}`);
+
+  if (client.adminStatusMapping.size === 0) {
+    console.log("⚠️ No admin status mappings, skipping refresh");
+    return;
+  }
+
+  try {
+    const embed = await buildAdminStatusEmbed();
+    console.log("✅ Built admin status embed for refresh");
+
+    let updatedCount = 0;
+    for (const [channelId, messageId] of client.adminStatusMapping.entries()) {
+      try {
+        console.log(
+          `🔄 Refreshing admin status in ${channelId}, message ${messageId}`
+        );
+        const channel = await client.channels.fetch(channelId);
+        if (!channel) {
+          console.log(`❌ Channel ${channelId} not found during refresh`);
+          continue;
+        }
+        const msg = await channel.messages.fetch(messageId);
+        if (!msg) {
+          console.log(`❌ Message ${messageId} not found during refresh`);
+          continue;
+        }
+        await msg.edit({
+          embeds: [embed],
+          components: [buildAdminStatusComponents()],
+        });
+        updatedCount++;
+        console.log(`✅ Refreshed admin status in ${channelId}`);
+      } catch (err) {
+        console.error(
+          `❌ Failed to refresh admin status in ${channelId}:`,
+          err.message
+        );
+      }
+    }
+
+    console.log(
+      `✅ refreshAdminStatus completed: ${updatedCount} channels updated`
+    );
+  } catch (e) {
+    console.error("❌ Failed to build admin status embed:", e.message);
+  }
+}
+
 async function buildAdminStatusEmbed() {
   const response = await invokeLambda({
     action: "admin-overview",
@@ -4260,22 +5096,392 @@ async function buildAdminStatusEmbed() {
     .setTimestamp();
 }
 
+function buildAdminStatusComponents() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("admin_refresh_status")
+      .setLabel("🔄 Refresh")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("admin_detailed_view")
+      .setLabel("📋 Detailed View")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("admin_emergency_actions")
+      .setLabel("🚨 Emergency Actions")
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
 // Cron refresh admin status every 5 minutes
 cron.schedule("*/5 * * * *", async () => {
-  if (client.adminStatusMapping.size === 0) return;
-  const embed = await buildAdminStatusEmbed();
-  for (const [channelId, messageId] of client.adminStatusMapping.entries()) {
-    try {
-      const channel = await client.channels.fetch(channelId);
-      if (!channel) continue;
-      const msg = await channel.messages.fetch(messageId);
-      if (!msg) continue;
-      await msg.edit({ embeds: [embed] });
-    } catch (err) {
-      console.error("Failed to refresh admin status:", err.message);
+  console.log("🔄 Admin status cron job running...");
+  console.log(`📊 Admin status mappings: ${client.adminStatusMapping.size}`);
+
+  if (client.adminStatusMapping.size === 0) {
+    console.log("⚠️ No admin status mappings found, skipping update");
+    return;
+  }
+
+  try {
+    const embed = await buildAdminStatusEmbed();
+    console.log("✅ Built admin status embed");
+
+    let updatedCount = 0;
+    for (const [channelId, messageId] of client.adminStatusMapping.entries()) {
+      try {
+        console.log(
+          `🔄 Updating admin status in channel ${channelId}, message ${messageId}`
+        );
+        const channel = await client.channels.fetch(channelId);
+        if (!channel) {
+          console.log(`❌ Channel ${channelId} not found`);
+          continue;
+        }
+        const msg = await channel.messages.fetch(messageId);
+        if (!msg) {
+          console.log(
+            `❌ Message ${messageId} not found in channel ${channelId}`
+          );
+          continue;
+        }
+        await msg.edit({
+          embeds: [embed],
+          components: [buildAdminStatusComponents()],
+        });
+        updatedCount++;
+        console.log(`✅ Updated admin status in channel ${channelId}`);
+      } catch (err) {
+        console.error(
+          `❌ Failed to refresh admin status in ${channelId}:`,
+          err.message
+        );
+      }
     }
+
+    console.log(
+      `✅ Admin status cron job completed: ${updatedCount} channels updated`
+    );
+  } catch (error) {
+    console.error("❌ Admin status cron job failed:", error.message);
   }
 });
+
+// Cron job to refresh all command channels every 3 minutes
+cron.schedule("*/3 * * * *", async () => {
+  console.log("🔄 Auto-refreshing command channel statuses...");
+
+  try {
+    // Get all instances from Lambda (single call for efficiency)
+    const result = await invokeLambda({
+      action: "list-all",
+      userId: "system",
+    });
+
+    let updatedCount = 0;
+    let checkedCount = 0;
+
+    for (const instance of result.instances) {
+      console.log(
+        `Checking instance ${instance.userId} (${instance.username}): status = ${instance.status}`
+      );
+
+      // Check all instances, not just specific statuses
+      // This ensures we catch any status changes
+
+      try {
+        // Check if we have a channel mapping for this user
+        const channelId = client.userChannels.get(instance.userId);
+        if (!channelId) continue;
+
+        const channel = client.channels.cache.get(channelId);
+        if (!channel) continue;
+
+        checkedCount++;
+
+        // For instances that should be running but aren't showing as running,
+        // force a status check to get the real status from ECS
+        if (
+          instance.taskArn &&
+          instance.status !== "running" &&
+          instance.status !== "stopped"
+        ) {
+          console.log(
+            `Forcing status check for instance ${instance.userId} with taskArn ${instance.taskArn}`
+          );
+          try {
+            const realStatus = await invokeLambda({
+              action: "status",
+              userId: instance.userId,
+            });
+            console.log(
+              `Real status for ${instance.userId}: ${realStatus.status} (was ${instance.status})`
+            );
+            instance.status = realStatus.status;
+          } catch (statusError) {
+            console.log(
+              `Failed to get real status for ${instance.userId}:`,
+              statusError.message
+            );
+          }
+        }
+
+        // Check if status actually changed since last update
+        const lastStatus = lastKnownStatus.get(instance.userId);
+        const statusChanged =
+          !lastStatus ||
+          lastStatus.status !== instance.status ||
+          lastStatus.updatedAt !== instance.updatedAt ||
+          lastStatus.url !== instance.url;
+
+        console.log(
+          `Status check for ${instance.userId}: lastStatus = ${lastStatus?.status}, currentStatus = ${instance.status}, changed = ${statusChanged}`
+        );
+
+        if (statusChanged) {
+          // Store current status
+          lastKnownStatus.set(instance.userId, {
+            status: instance.status,
+            updatedAt: instance.updatedAt,
+            url: instance.url,
+          });
+
+          // Try to update existing message, or send new one if not found
+          const existingMessageId = client.userStatusMessages.get(
+            instance.userId
+          );
+          let messageUpdated = false;
+
+          if (existingMessageId) {
+            try {
+              const existingMessage = await channel.messages.fetch(
+                existingMessageId
+              );
+
+              if (instance.status === "running") {
+                console.log(
+                  `Updating control panel for running instance ${instance.userId}`
+                );
+                // For running instances, we need to send a new message since control panel has buttons
+                await existingMessage.delete();
+                await sendInstanceControlPanel(
+                  channel,
+                  instance.userId,
+                  instance
+                );
+              } else {
+                console.log(
+                  `Updating status message for instance ${instance.userId} with status ${instance.status}`
+                );
+                // For non-running instances, we can update the existing message
+                const statusEmbed = await buildStatusEmbed(instance);
+                await existingMessage.edit({ embeds: [statusEmbed] });
+                messageUpdated = true;
+              }
+            } catch (error) {
+              console.log(
+                `Could not update existing message for ${instance.userId}, sending new one:`,
+                error.message
+              );
+              // Message not found or can't be edited, send new one
+              if (instance.status === "running") {
+                await sendInstanceControlPanel(
+                  channel,
+                  instance.userId,
+                  instance
+                );
+              } else {
+                await sendStatusUpdate(channel, instance);
+              }
+            }
+          } else {
+            // No existing message, send new one
+            if (instance.status === "running") {
+              console.log(
+                `Sending new control panel for running instance ${instance.userId}`
+              );
+              await sendInstanceControlPanel(
+                channel,
+                instance.userId,
+                instance
+              );
+            } else {
+              console.log(
+                `Sending new status update for instance ${instance.userId} with status ${instance.status}`
+              );
+              await sendStatusUpdate(channel, instance);
+            }
+          }
+
+          updatedCount++;
+        }
+      } catch (error) {
+        console.log(
+          `Failed to refresh status for user ${instance.userId}:`,
+          error.message
+        );
+      }
+    }
+
+    if (checkedCount > 0) {
+      console.log(
+        `🔄 Checked ${checkedCount} channels, updated ${updatedCount} with changes`
+      );
+    }
+  } catch (error) {
+    console.log("⚠️ Failed to auto-refresh command channels:", error.message);
+  }
+});
+
+// Clean up old status cache entries every hour to prevent memory leaks
+cron.schedule("0 * * * *", async () => {
+  console.log("🧹 Cleaning up old status cache entries...");
+
+  try {
+    // Get current active instances
+    const result = await invokeLambda({
+      action: "list-all",
+      userId: "system",
+    });
+
+    const activeUserIds = new Set(result.instances.map((i) => i.userId));
+    let removedCount = 0;
+
+    // Remove cache entries for users who no longer have instances
+    for (const userId of lastKnownStatus.keys()) {
+      if (!activeUserIds.has(userId)) {
+        lastKnownStatus.delete(userId);
+        client.userStatusMessages.delete(userId);
+        removedCount++;
+      }
+    }
+
+    if (removedCount > 0) {
+      console.log(`🧹 Cleaned up ${removedCount} old status cache entries`);
+    }
+  } catch (error) {
+    console.log("⚠️ Failed to clean up status cache:", error.message);
+  }
+});
+
+// Check for scheduled session notifications every 2 minutes
+cron.schedule("*/2 * * * *", async () => {
+  console.log("🔔 Checking for scheduled session notifications...");
+
+  try {
+    // Get all instances to check for recently started scheduled sessions
+    const result = await invokeLambda({
+      action: "list-all",
+      userId: "system",
+    });
+
+    const now = Math.floor(Date.now() / 1000);
+    const twoMinutesAgo = now - 120; // 2 minutes ago
+
+    for (const instance of result.instances) {
+      // Check if this is a scheduled session that started recently
+      if (
+        instance.linkedSessionId &&
+        instance.status === "running" &&
+        instance.startedAt &&
+        instance.startedAt >= twoMinutesAgo
+      ) {
+        try {
+          // Get session details
+          const sessionResult = await invokeLambda({
+            action: "list-sessions",
+            userId: instance.userId,
+          });
+
+          const session = sessionResult.sessions?.find(
+            (s) => s.sessionId === instance.linkedSessionId
+          );
+
+          if (session && session.status === "active") {
+            // Send notification to user
+            await sendScheduledSessionNotification(
+              instance.userId,
+              session,
+              instance
+            );
+          }
+        } catch (error) {
+          console.log(
+            `Failed to send notification for user ${instance.userId}:`,
+            error.message
+          );
+        }
+      }
+    }
+  } catch (error) {
+    console.log("⚠️ Failed to check for notifications:", error.message);
+  }
+});
+
+// Function to send scheduled session notifications to users
+async function sendScheduledSessionNotification(userId, session, instance) {
+  try {
+    // Find the user's command channel
+    const channelId = client.userChannels.get(userId);
+    if (!channelId) {
+      console.log(`No command channel found for user ${userId}`);
+      return;
+    }
+
+    const channel = client.channels.cache.get(channelId);
+    if (!channel) {
+      console.log(`Channel ${channelId} not found for user ${userId}`);
+      return;
+    }
+
+    // Create notification embed
+    const notificationEmbed = new EmbedBuilder()
+      .setColor("#00ff00")
+      .setTitle("🎮 Scheduled Session Ready!")
+      .setDescription(
+        `Your scheduled session **"${
+          session.title || "Foundry VTT Session"
+        }"** is now ready and running!`
+      )
+      .addFields([
+        {
+          name: "Session Details",
+          value: [
+            `**Start Time:** <t:${session.startTime}:F>`,
+            `**End Time:** <t:${session.endTime}:F>`,
+            `**Duration:** ${Math.round(
+              (session.endTime - session.startTime) / 60
+            )} minutes`,
+            `**License Type:** ${session.licenseType?.toUpperCase()}`,
+          ].join("\n"),
+          inline: true,
+        },
+        {
+          name: "Access Information",
+          value: [
+            `**URL:** ${instance.url}`,
+            `**Status:** ${getStatusEmoji(instance.status)} Running`,
+            `**Auto-Shutdown:** <t:${instance.autoShutdownAt}:R>`,
+          ].join("\n"),
+          inline: true,
+        },
+      ])
+      .setTimestamp();
+
+    // Send notification to the user's command channel
+    await channel.send({
+      content: `<@${userId}> Your scheduled session is ready! 🎉`,
+      embeds: [notificationEmbed],
+    });
+
+    console.log(`✅ Sent scheduled session notification to user ${userId}`);
+  } catch (error) {
+    console.error(
+      `Failed to send scheduled session notification to user ${userId}:`,
+      error
+    );
+  }
+}
 
 // Login to Discord
 client.login(process.env.DISCORD_TOKEN);

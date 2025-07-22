@@ -87,7 +87,10 @@ export class LicenseScheduler {
       endTime
     );
     const conflictingSessionIds = conflictingSessions
-      .filter((session) => session.licenseId === licenseId)
+      .filter(
+        (session) =>
+          session.licenseId === licenseId && session.status !== "cancelled"
+      )
       .map((session) => session.sessionId);
 
     const hasConflicts =

@@ -150,6 +150,18 @@ async function handleDashboard(interaction, userId) {
       licenseDisplay = `❔ Unknown License Type: ${licenseType}`;
     }
 
+    // Get monthly cost data for dashboard display
+    let costData = null;
+    try {
+      const costResult = await interaction.invokeLambda({
+        action: "get-user-costs",
+        userId: userId,
+      });
+      costData = costResult;
+    } catch (error) {
+      console.log("Could not fetch cost data for dashboard:", error);
+    }
+
     const embed = new EmbedBuilder()
       .setColor(result.status === "running" ? "#00ff00" : "#888888")
       .setTitle("🎲 Your Foundry VTT Dashboard")
@@ -168,6 +180,41 @@ async function handleDashboard(interaction, userId) {
           value: licenseDisplay,
           inline: true,
         },
+        ...(costData
+          ? [
+              {
+                name: "💰 This Month's Usage",
+                value: `**${costData.hoursUsed.toFixed(
+                  1
+                )}h** = $${costData.totalCost.toFixed(2)}`,
+                inline: true,
+              },
+              {
+                name:
+                  costData.uncoveredCost > 0
+                    ? "💸 Uncovered Cost"
+                    : "✅ Fully Covered",
+                value:
+                  costData.uncoveredCost > 0
+                    ? `$${costData.uncoveredCost.toFixed(2)}`
+                    : "All costs covered! 🎉",
+                inline: true,
+              },
+              ...(costData.donationsReceived > 0
+                ? [
+                    {
+                      name: "☕ Donations Received",
+                      value: `$${costData.donationsReceived.toFixed(2)}${
+                        costData.lastDonorName
+                          ? ` (Latest: ${costData.lastDonorName})`
+                          : ""
+                      }`,
+                      inline: true,
+                    },
+                  ]
+                : []),
+            ]
+          : []),
         ...(licenseOwnerInfo
           ? [
               {
@@ -310,6 +357,19 @@ async function handleDashboard(interaction, userId) {
         .setEmoji("💀")
     );
 
+    // Third row for Ko-fi donation if uncovered costs exist
+    let thirdRow = null;
+    if (costData && costData.uncoveredCost > 0 && process.env.KOFI_URL) {
+      const suggestedAmount = Math.min(costData.uncoveredCost, 5).toFixed(2);
+      thirdRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setURL(process.env.KOFI_URL)
+          .setLabel(`☕ Cover $${suggestedAmount} on Ko-fi`)
+          .setStyle(ButtonStyle.Link)
+          .setEmoji("💖")
+      );
+    }
+
     // Create version selection dropdown
     const currentVersion = result.foundryVersion || "13";
     const versionLabels = {
@@ -361,9 +421,13 @@ async function handleDashboard(interaction, userId) {
         ])
     );
 
+    const components = [actionRow, secondRow];
+    if (thirdRow) components.push(thirdRow);
+    components.push(versionSelectRow);
+
     await interaction.editReply({
       embeds: [embed],
-      components: [actionRow, secondRow, versionSelectRow],
+      components: components,
     });
   } catch (error) {
     if (error.message.includes("not found")) {
@@ -419,7 +483,8 @@ function createRegistrationEmbed() {
       },
       {
         name: "Costs",
-        value: "• Billed only while the instance is running\n• No upfront fees",
+        value:
+          "• Transparent usage tracking\n• Voluntary cost coverage via Ko-fi\n• No upfront fees or forced payments",
       },
       {
         name: "Management",
@@ -432,13 +497,26 @@ function createRegistrationEmbed() {
 }
 
 function createRegistrationActionRow() {
-  return new ActionRowBuilder().addComponents(
+  const buttons = [
     new ButtonBuilder()
       .setCustomId("foundry_register")
       .setLabel("🎮 Register New Instance")
       .setStyle(ButtonStyle.Primary)
-      .setEmoji("📝")
-  );
+      .setEmoji("📝"),
+  ];
+
+  // Add Ko-fi support button if configured
+  if (process.env.KOFI_URL && process.env.KOFI_URL.trim() !== "") {
+    buttons.push(
+      new ButtonBuilder()
+        .setURL(process.env.KOFI_URL)
+        .setLabel("☕ Support the Server")
+        .setStyle(ButtonStyle.Link)
+        .setEmoji("💖")
+    );
+  }
+
+  return new ActionRowBuilder().addComponents(...buttons);
 }
 
 async function handleSetupRegistration(interaction) {

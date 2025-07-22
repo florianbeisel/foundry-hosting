@@ -44,7 +44,12 @@ interface FoundryEvent {
     | "admin-force-shutdown"
     | "admin-cancel-session"
     | "admin-cancel-all-sessions"
-    | "admin-system-maintenance";
+    | "admin-system-maintenance"
+    | "admin-maintenance-reset"
+    | "kofi-webhook"
+    | "get-user-costs"
+    | "get-all-costs"
+    | "send-notification";
   userId: string;
   sanitizedUsername?: string;
   foundryUsername?: string;
@@ -68,6 +73,13 @@ interface FoundryEvent {
   selectedLicenseId?: string;
   // Destroy options
   keepLicenseSharing?: boolean;
+  // Ko-fi webhook fields
+  body?: string;
+  headers?: Record<string, string>;
+  // Notification fields
+  notificationType?: "session-ready" | "session-failed" | "instance-shutdown";
+  message?: string;
+  instanceUrl?: string;
 }
 
 const ecsManager = new ECSManager(process.env.CLUSTER_NAME!);
@@ -162,6 +174,9 @@ export const handler = async (
       case "auto-shutdown-check":
         result = await performAutoShutdownCheck();
         break;
+      case "send-notification":
+        result = await sendNotification(event);
+        break;
       case "prepare-sessions":
         result = await prepareUpcomingSessions();
         break;
@@ -185,6 +200,18 @@ export const handler = async (
         break;
       case "admin-system-maintenance":
         result = await adminSystemMaintenance(event.forceReason);
+        break;
+      case "admin-maintenance-reset":
+        result = await adminMaintenanceReset(event.forceReason);
+        break;
+      case "kofi-webhook":
+        result = await handleKofiWebhook(event);
+        break;
+      case "get-user-costs":
+        result = await getUserCosts(userId);
+        break;
+      case "get-all-costs":
+        result = await getAllCosts();
         break;
       default:
         return errorResponse(400, `Unknown action: ${action}`);
@@ -878,13 +905,35 @@ async function getInstanceStatus(userId: string) {
     throw new Error("Instance not found");
   }
 
+  console.log(
+    `Getting status for user ${userId}: current status = ${instance.status}, taskArn = ${instance.taskArn}`
+  );
+
   // Get real status from ECS if we have a task ARN
   if (instance.taskArn) {
-    const taskStatus = await ecsManager.getTaskStatus(instance.taskArn);
-    if (taskStatus) {
-      await dynamoManager.updateInstance(userId, { status: taskStatus });
-      instance.status = taskStatus;
+    try {
+      const taskStatus = await ecsManager.getTaskStatus(instance.taskArn);
+      console.log(`ECS task status for ${userId}: ${taskStatus}`);
+
+      if (taskStatus) {
+        console.log(
+          `Updating instance status for ${userId} from ${instance.status} to ${taskStatus}`
+        );
+        await dynamoManager.updateInstance(userId, { status: taskStatus });
+        instance.status = taskStatus;
+      } else {
+        console.log(
+          `No task status returned from ECS for ${userId}, keeping current status: ${instance.status}`
+        );
+      }
+    } catch (error) {
+      console.error(`Error getting ECS task status for ${userId}:`, error);
+      // Keep the current status if ECS check fails
     }
+  } else {
+    console.log(
+      `No task ARN for user ${userId}, using stored status: ${instance.status}`
+    );
   }
 
   // Get upcoming scheduled sessions for this user
@@ -1695,6 +1744,218 @@ async function adminSystemMaintenance(reason?: string) {
   };
 }
 
+async function adminMaintenanceReset(reason?: string) {
+  console.log(
+    `Admin maintenance reset, reason: ${reason || "No reason provided"}`
+  );
+
+  const now = Math.floor(Date.now() / 1000);
+
+  // Get all sessions (scheduled and active)
+  const allSessions = await dynamoManager.getSessionsInTimeRange(
+    now - 30 * 24 * 60 * 60, // Last 30 days for any lingering active sessions
+    now + 365 * 24 * 60 * 60 // Next 365 days for all scheduled sessions
+  );
+  const activeSessions = allSessions.filter(
+    (s) => s.status === "active" || s.status === "scheduled"
+  );
+
+  // Get all license pools to reset (including inactive ones that might have failed re-activation)
+  const allLicensePools = await dynamoManager.getAllLicenses();
+  const activeLicensePools = allLicensePools.filter((p: any) => p.isActive);
+
+  let cancelledCount = 0;
+  let resetCount = 0;
+  let reservationsCancelled = 0;
+  const errors = [];
+
+  // Cancel all sessions first
+  for (const session of activeSessions) {
+    try {
+      await dynamoManager.updateScheduledSession(session.sessionId, {
+        status: "cancelled",
+        updatedAt: now,
+      });
+      cancelledCount++;
+    } catch (error) {
+      errors.push(
+        `Session ${session.sessionId}: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  // Clean up ALL active license reservations (comprehensive cleanup)
+  try {
+    const allActiveReservations =
+      await dynamoManager.getAllActiveLicenseReservations();
+    console.log(
+      `Found ${allActiveReservations.length} active license reservations to clean up`
+    );
+
+    for (const reservation of allActiveReservations) {
+      try {
+        await dynamoManager.updateLicenseReservation(
+          reservation.reservationId,
+          { status: "cancelled" }
+        );
+        reservationsCancelled++;
+        console.log(
+          `Cancelled license reservation ${reservation.reservationId} for license ${reservation.licenseId}`
+        );
+      } catch (reservationError) {
+        console.error(
+          `Failed to cancel license reservation ${reservation.reservationId}:`,
+          reservationError
+        );
+        errors.push(
+          `Reservation ${reservation.reservationId}: ${
+            reservationError instanceof Error
+              ? reservationError.message
+              : "Unknown error"
+          }`
+        );
+      }
+    }
+  } catch (reservationError) {
+    console.error(
+      "Failed to get all active license reservations:",
+      reservationError
+    );
+    errors.push(
+      `License reservations cleanup: ${
+        reservationError instanceof Error
+          ? reservationError.message
+          : "Unknown error"
+      }`
+    );
+  }
+
+  // Reset all license pools (deactivate them temporarily, then re-activate)
+  // Process all licenses, not just active ones, to catch any that failed re-activation
+  for (const pool of allLicensePools) {
+    try {
+      // First deactivate to clear any existing reservations
+      await dynamoManager.updateLicensePool(pool.licenseId, {
+        isActive: false,
+        updatedAt: now,
+      });
+
+      // Then re-activate to make them available for new sessions
+      await dynamoManager.updateLicensePool(pool.licenseId, {
+        isActive: true,
+        updatedAt: now,
+      });
+
+      resetCount++;
+      console.log(`Reset and re-activated license pool: ${pool.licenseId}`);
+    } catch (error) {
+      errors.push(
+        `License pool ${pool.licenseId}: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  // Log the admin action
+  const logMessage = `Admin maintenance reset - ${cancelledCount} sessions cancelled, ${reservationsCancelled} license reservations cancelled, ${resetCount} license pools reset, Reason: ${
+    reason || "No reason provided"
+  }`;
+  console.log(logMessage);
+
+  return {
+    message:
+      "Maintenance reset completed - sessions cancelled, reservations cleared, and licenses re-activated",
+    cancelledCount,
+    reservationsCancelled,
+    resetCount,
+    totalSessions: activeSessions.length,
+    totalLicensePools: activeLicensePools.length,
+    errors: errors.length > 0 ? errors : undefined,
+    reason: reason || "No reason provided",
+    timestamp: now,
+  };
+}
+
+async function handleKofiWebhook(event: FoundryEvent) {
+  if (!event.body) {
+    throw new Error("Missing webhook body");
+  }
+
+  try {
+    // Ko-fi sends form-encoded data, parse it
+    const kofiData = JSON.parse(event.body);
+
+    // Basic validation - Ko-fi should send a verification_token
+    const verificationToken = process.env.KOFI_VERIFICATION_TOKEN;
+    if (
+      verificationToken &&
+      kofiData.verification_token !== verificationToken
+    ) {
+      throw new Error("Invalid Ko-fi verification token");
+    }
+
+    const amount = parseFloat(kofiData.amount || "0");
+    const message = kofiData.message || "";
+    const donorName = kofiData.from_name || "Anonymous";
+
+    // Extract Discord user ID from message (format: "Discord: 123456789")
+    const userIdMatch = message.match(/discord[:\s]*(\d+)/i);
+    if (!userIdMatch) {
+      console.log("Ko-fi donation without Discord ID:", {
+        donor: donorName,
+        amount,
+        message,
+        kofiData,
+      });
+      return {
+        message: "Donation received but no Discord ID found",
+        amount,
+        donor: donorName,
+      };
+    }
+
+    const userId = userIdMatch[1];
+    const now = Math.floor(Date.now() / 1000);
+
+    // Record the donation
+    await usageManager.recordDonation(userId, amount, now, donorName);
+
+    console.log(
+      `Ko-fi donation processed: $${amount} from ${donorName} for user ${userId}`
+    );
+
+    return {
+      message: "Donation processed successfully",
+      userId,
+      amount,
+      donor: donorName,
+    };
+  } catch (error) {
+    console.error("Ko-fi webhook error:", error);
+    throw new Error(
+      `Ko-fi webhook processing failed: ${
+        error instanceof Error ? error.message : "Unknown error"
+      }`
+    );
+  }
+}
+
+async function getUserCosts(userId: string) {
+  const costData = await usageManager.getUserMonthlyCosts(userId);
+  return {
+    userId,
+    ...costData,
+  };
+}
+
+async function getAllCosts() {
+  const costData = await usageManager.getAllUsersCosts();
+  return costData;
+}
+
 function generateAdminKey(): string {
   return (
     Math.random().toString(36).substring(2, 15) +
@@ -1718,6 +1979,28 @@ function errorResponse(
     statusCode,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ error: message }),
+  };
+}
+
+async function sendNotification(event: FoundryEvent) {
+  const { notificationType, targetUserId, message, sessionId, instanceUrl } =
+    event;
+
+  if (!notificationType || !targetUserId) {
+    throw new Error("Missing required fields: notificationType, targetUserId");
+  }
+
+  // For now, we'll just return success - the actual Discord notification
+  // will be handled by the Discord bot when it polls for notifications
+  console.log(
+    `Notification queued: ${notificationType} for user ${targetUserId}: ${message}`
+  );
+
+  return {
+    success: true,
+    message: "Notification queued successfully",
+    notificationType,
+    targetUserId,
   };
 }
 

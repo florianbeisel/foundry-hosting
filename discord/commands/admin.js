@@ -288,14 +288,20 @@ module.exports = {
         if (existingMsgId) {
           try {
             const msg = await statusChannel.messages.fetch(existingMsgId);
-            await msg.edit({ embeds: [statusEmbed] });
+            await msg.edit({
+              embeds: [statusEmbed],
+              components: [actionRow],
+            });
             messageId = existingMsgId;
           } catch {
             // message not found, fallthrough to send new
           }
         }
         if (!messageId) {
-          const sent = await statusChannel.send({ embeds: [statusEmbed] });
+          const sent = await statusChannel.send({
+            embeds: [statusEmbed],
+            components: [actionRow],
+          });
           messageId = sent.id;
         }
 

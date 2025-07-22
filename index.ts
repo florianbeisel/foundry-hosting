@@ -708,6 +708,9 @@ const instanceManagementLambda = new aws.lambda.Function(
         ALB_HTTPS_LISTENER_ARN: httpsListener.arn,
         ROUTE53_HOSTED_ZONE_ID: hostedZoneId,
         DOMAIN_NAME: domainName,
+        // Ko-fi integration
+        KOFI_VERIFICATION_TOKEN: config.get("kofiVerificationToken") || "",
+        KOFI_URL: config.get("kofiUrl") || "",
       },
     },
     tags: {
@@ -788,6 +791,7 @@ const discordBotSecretVersion = new aws.secretsmanager.SecretVersion(
       FOUNDRY_CATEGORY_ID: discordConfig.get("categoryId") || "", // Optional category for organizing channels
       ALLOWED_ROLES: discordConfig.get("allowedRoles") || "",
       ADMIN_ROLES: discordConfig.get("adminRoles") || "Admin",
+      KOFI_URL: config.get("kofiUrl") || "",
     }),
   }
 );
@@ -861,6 +865,10 @@ const discordBotTaskDefinition = new aws.ecs.TaskDefinition(
                 name: "NODE_ENV",
                 value: "production",
               },
+              {
+                name: "BOT_CONFIG_TABLE_NAME",
+                value: botConfigTable.name,
+              },
             ],
             secrets: [
               {
@@ -886,6 +894,10 @@ const discordBotTaskDefinition = new aws.ecs.TaskDefinition(
               {
                 name: "ADMIN_ROLES",
                 valueFrom: `${secretArn}:ADMIN_ROLES::`,
+              },
+              {
+                name: "KOFI_URL",
+                valueFrom: `${secretArn}:KOFI_URL::`,
               },
             ],
             healthCheck: {

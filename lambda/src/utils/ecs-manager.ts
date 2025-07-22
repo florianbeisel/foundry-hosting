@@ -302,19 +302,29 @@ export class ECSManager {
 
   async getTaskStatus(taskArn: string): Promise<string | null> {
     try {
+      console.log(
+        `Getting ECS task status for: ${taskArn} in cluster: ${this.clusterName}`
+      );
+
       const command = new DescribeTasksCommand({
         cluster: this.clusterName,
         tasks: [taskArn],
       });
 
       const response = await this.ecs.send(command);
+      console.log(
+        `ECS response for ${taskArn}:`,
+        JSON.stringify(response, null, 2)
+      );
 
       if (!response.tasks || response.tasks.length === 0) {
+        console.log(`No tasks found for ${taskArn}`);
         return null;
       }
 
       const task = response.tasks[0];
       const lastStatus = task.lastStatus?.toLowerCase();
+      console.log(`Task ${taskArn} lastStatus: ${lastStatus}`);
 
       // Map ECS statuses to our simplified statuses
       const statusMap: Record<string, string> = {
@@ -325,7 +335,12 @@ export class ECSManager {
         deactivating: "stopping",
       };
 
-      return statusMap[lastStatus || ""] || "unknown";
+      const mappedStatus = statusMap[lastStatus || ""] || "unknown";
+      console.log(
+        `Mapped status for ${taskArn}: ${lastStatus} -> ${mappedStatus}`
+      );
+
+      return mappedStatus;
     } catch (error) {
       console.error("Error getting task status:", error);
       return null;
