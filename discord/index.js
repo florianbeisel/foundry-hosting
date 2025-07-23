@@ -20,15 +20,61 @@ const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
 const cron = require("node-cron");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 
+// Import constants
+const {
+  SUPPORTER_ROLES,
+  CHANNEL_NAMES,
+  COLORS,
+  STATUS_EMOJIS,
+  INTERVALS,
+  LIMITS,
+  MESSAGES,
+} = require("./constants");
+
+// Import instance management functions
+const {
+  handleStartInstance,
+  handleStopInstance,
+  performStopInstance,
+  handleStopCancelSession,
+  handleStopRestart,
+  handleStopCancel,
+} = require("./instanceManagement");
+
+// ================================================================================
+// DISCORD BOT FOR FOUNDRY VTT MANAGEMENT
+// ================================================================================
+// This file contains the complete Discord bot implementation for managing
+// Foundry VTT instances. The code is organized into the following sections:
+//
+// 1. Configuration and Constants
+// 2. Database Operations
+// 3. Logging and Console Setup
+// 4. UI Components and Embeds
+// 5. Utility Functions
+// 6. Channel Management
+// 7. AWS Lambda Operations
+// 8. Permission Utilities
+// 9. Monitoring and Status
+// 10. Bot Events and Initialization
+// 11. Interaction Handlers
+// 12. Command Handlers
+// 13. Button Interaction Handlers
+// 14. Modal Handlers
+// 15. Select Menu Handlers
+// 16. Registration and Stats
+// 17. Admin Functions
+// 18. Unified Dashboard
+// ================================================================================
+
 // =================
 // SUPPORTER ROLES
 // =================
 
-const SUPPORTER_ROLES = {
-  "699727231794020353": 15, // $15 supporter
-  "699727011979067484": 10, // $10 supporter
-  "699727432424620033": 5, // $5 supporter
-};
+
+// ================================================================================
+// CONFIGURATION AND CONSTANTS
+// ================================================================================
 
 function getUserSupporterAmount(member) {
   if (!member) return 0;
@@ -56,6 +102,10 @@ if (botConfigTableName) {
   botConfigDynamo = DynamoDBDocumentClient.from(ddbClient);
 }
 
+
+// ================================================================================
+// DATABASE OPERATIONS
+// ================================================================================
 async function loadRegistrationStatsMappingFromDB() {
   if (!botConfigDynamo) return null;
   try {
@@ -319,6 +369,10 @@ let loggingChannel = null;
 let logQueue = [];
 let isProcessingLogs = false;
 
+
+// ================================================================================
+// LOGGING AND CONSOLE SETUP
+// ================================================================================
 async function setupLoggingChannel() {
   try {
     // Find the first guild (server) the bot is in
@@ -330,7 +384,7 @@ async function setupLoggingChannel() {
 
     // Check if logging channel already exists
     let existingChannel = guild.channels.cache.find(
-      (c) => c.name === "foundry-bot-logs"
+      (c) => c.name === CHANNEL_NAMES.LOGGING
     );
 
     if (existingChannel) {
@@ -339,7 +393,7 @@ async function setupLoggingChannel() {
     } else {
       // Create new logging channel
       loggingChannel = await guild.channels.create({
-        name: "foundry-bot-logs",
+        name: CHANNEL_NAMES.LOGGING,
         type: ChannelType.GuildText,
         permissionOverwrites: [
           {
@@ -546,6 +600,10 @@ client.userDashboardMessages = new Map(); // userId -> dashboard messageId
 const lastKnownStatus = new Map(); // userId -> { status, updatedAt, url }
 
 // Helper function to build status embed for message updates
+
+// ================================================================================
+// UI COMPONENTS AND EMBEDS
+// ================================================================================
 async function buildStatusEmbed(status) {
   const statusEmoji = {
     running: "🟢",
@@ -654,6 +712,10 @@ fs.readdirSync(commandsPath)
   });
 
 // Helper function to sanitize Discord username for URL use
+
+// ================================================================================
+// UTILITY FUNCTIONS
+// ================================================================================
 function sanitizeUsername(username) {
   return username
     .toLowerCase()
@@ -740,15 +802,7 @@ async function clearChannelMessages(channel) {
 
 // Helper function to get status emoji
 function getStatusEmoji(status) {
-  const statusEmojis = {
-    running: "🟢",
-    starting: "🟡",
-    stopping: "🟠",
-    stopped: "🔴",
-    created: "⚪",
-    unknown: "❔",
-  };
-  return statusEmojis[status] || "❔";
+  return STATUS_EMOJIS[status] || STATUS_EMOJIS.unknown;
 }
 
 /**
@@ -780,6 +834,10 @@ function createKofiSupportButton(
 }
 
 // Helper function to find existing command channel for a user
+
+// ================================================================================
+// CHANNEL MANAGEMENT
+// ================================================================================
 async function findExistingCommandChannel(guild, userId, username) {
   await guild.channels.fetch(); // Ensure we have all channels in cache
 
@@ -817,6 +875,10 @@ async function findExistingCommandChannel(guild, userId, username) {
 }
 
 // Helper function to invoke Lambda
+
+// ================================================================================
+// AWS LAMBDA OPERATIONS
+// ================================================================================
 async function invokeLambda(payload) {
   console.log(
     "Invoking Lambda with payload:",
@@ -891,6 +953,10 @@ async function getUserCostsWithSupporter(userId, guild) {
 }
 
 // Helper functions for permissions and channels
+
+// ================================================================================
+// PERMISSION UTILITIES
+// ================================================================================
 function hasRequiredRole(member) {
   // Handle null member (DMs or missing member info)
   if (!member || !member.roles) return false;
@@ -1088,6 +1154,10 @@ async function deleteUserCommandChannel(guild, userId) {
   }
 }
 
+
+// ================================================================================
+// MONITORING AND STATUS
+// ================================================================================
 function startStatusMonitoring(userId, channelId) {
   // Clear any existing monitor
   stopStatusMonitoring(userId);
@@ -1315,6 +1385,10 @@ async function syncAllInstances() {
   }
 }
 
+
+// ================================================================================
+// BOT EVENTS AND INITIALIZATION
+// ================================================================================
 // Bot ready event
 client.once("ready", async () => {
   console.log(`✅ Foundry VTT Bot is ready! Logged in as ${client.user.tag}`);
@@ -1457,6 +1531,10 @@ process.on("unhandledRejection", (error) => {
   console.error("Unhandled promise rejection:", error);
 });
 
+
+// ================================================================================
+// INTERACTION HANDLERS
+// ================================================================================
 // Interaction handling
 client.on("interactionCreate", async (interaction) => {
   if (interaction.isChatInputCommand()) {
@@ -1475,6 +1553,10 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
+
+// ================================================================================
+// COMMAND HANDLERS
+// ================================================================================
 async function handleSlashCommand(interaction) {
   // Skip role check for DMs (no guild member context)
   if (interaction.guild && !hasRequiredRole(interaction.member)) {
@@ -1541,6 +1623,10 @@ async function handleSlashCommand(interaction) {
   }
 }
 
+
+// ================================================================================
+// BUTTON INTERACTION HANDLERS
+// ================================================================================
 async function handleButtonInteraction(interaction) {
   const parts = interaction.customId.split("_");
   const [action, subAction] = parts;
@@ -1803,7 +1889,10 @@ async function handleButtonInteraction(interaction) {
 
   if (confirmAction === "stop_cancel_session") {
     try {
-      await handleStopCancelSession(interaction, userId);
+      await handleStopCancelSession(interaction, userId, {
+        invokeLambda,
+        stopStatusMonitoring,
+      });
       return;
     } catch (error) {
       console.error("Stop cancel session error:", error);
@@ -1816,7 +1905,12 @@ async function handleButtonInteraction(interaction) {
 
   if (confirmAction === "stop_restart") {
     try {
-      await handleStopRestart(interaction, userId);
+      await handleStopRestart(interaction, userId, {
+        invokeLambda,
+        stopStatusMonitoring,
+        startStatusMonitoring,
+        client,
+      });
       return;
     } catch (error) {
       console.error("Stop restart error:", error);
@@ -1829,7 +1923,7 @@ async function handleButtonInteraction(interaction) {
 
   if (confirmAction === "stop_cancel") {
     try {
-      await handleStopCancel(interaction, userId);
+      await handleStopCancel(interaction, userId, {});
       return;
     } catch (error) {
       console.error("Stop cancel error:", error);
@@ -1857,10 +1951,24 @@ async function handleButtonInteraction(interaction) {
   try {
     switch (subAction) {
       case "start":
-        await handleStartButton(interaction, userId);
+        await handleStartInstance(interaction, userId, {
+          invokeLambda,
+          client,
+          findExistingCommandChannel,
+          createUserCommandChannel,
+          safeChannelSend,
+          startStatusMonitoring,
+        });
         break;
       case "stop":
-        await handleStopButton(interaction, userId);
+        await handleStopInstance(interaction, userId, {
+          invokeLambda,
+          performStopInstance: (interaction, userId) => 
+            performStopInstance(interaction, userId, {
+              invokeLambda,
+              stopStatusMonitoring,
+            }),
+        });
         break;
       case "status":
         await handleStatusButton(interaction, userId);
@@ -2484,6 +2592,10 @@ async function handleAdminButtonInteraction(interaction) {
   }
 }
 
+
+// ================================================================================
+// MODAL HANDLERS
+// ================================================================================
 async function handleModalSubmit(interaction) {
   if (interaction.customId.startsWith("foundry_credentials_")) {
     await handleCredentialsModal(interaction);
@@ -2966,93 +3078,6 @@ async function handleScheduleModal(interaction) {
   }
 }
 
-async function handleStartButton(interaction, userId) {
-  const result = await invokeLambda({
-    action: "start",
-    userId: userId,
-  });
-
-  const embed = new EmbedBuilder()
-    .setColor("#ffff00")
-    .setTitle("🚀 Starting Instance")
-    .setDescription("Starting up, takes 2-3 minutes.")
-    .addFields([
-      { name: "Status", value: "🟡 Starting", inline: true },
-      { name: "Estimated Time", value: "2-3 minutes", inline: true },
-      {
-        name: "Your URL",
-        value: result.url || "Will be available shortly",
-        inline: false,
-      },
-    ])
-    .setTimestamp();
-
-  // Get or create user command channel (don't send duplicate to interaction reply)
-  let channelId = client.userChannels.get(userId);
-  let channel;
-
-  if (!channelId) {
-    // First try to find existing channel
-    const user = await client.users.fetch(userId);
-    channel = await findExistingCommandChannel(
-      interaction.guild,
-      userId,
-      user.username
-    );
-
-    if (!channel) {
-      // No existing channel found, create new one
-      channel = await createUserCommandChannel(
-        interaction.guild,
-        userId,
-        user.username
-      );
-    }
-    channelId = channel.id;
-  } else {
-    channel = client.channels.cache.get(channelId);
-  }
-
-  if (channel) {
-    // Send starting message to command channel only (avoid duplication)
-    await interaction.editReply({
-      content: `🚀 Starting... Check ${channel}`,
-    });
-
-    try {
-      await safeChannelSend(
-        channel,
-        { embeds: [embed] },
-        // Fallback: create new channel if current one is inaccessible
-        async () => {
-          const user = await client.users.fetch(userId);
-          return await createUserCommandChannel(
-            interaction.guild,
-            userId,
-            user.username
-          );
-        }
-      );
-
-      // Start status monitoring immediately to catch when instance becomes ready
-      startStatusMonitoring(userId, channelId);
-    } catch (error) {
-      console.error("Failed to send message to any channel:", error);
-      await interaction.editReply({
-        content:
-          "❌ Unable to access or create your command channel. Please contact an admin.",
-      });
-    }
-  } else {
-    console.error(
-      `Channel not found for user ${userId}, channelId: ${channelId}`
-    );
-    await interaction.editReply({
-      content:
-        "❌ Command channel not found. Please try creating a new instance.",
-    });
-  }
-}
 
 async function handleStopButton(interaction, userId) {
   // First check if this instance is running a scheduled session
@@ -3768,6 +3793,10 @@ async function handleDestroyCancelButton(interaction, userId) {
   });
 }
 
+
+// ================================================================================
+// SELECT MENU HANDLERS
+// ================================================================================
 async function handleSelectMenuInteraction(interaction) {
   const parts = interaction.customId.split("_");
 
@@ -5421,6 +5450,10 @@ cron.schedule("*/5 * * * *", async () => {
 });
 
 // Function to refresh all stats embeds in registration channels
+
+// ================================================================================
+// REGISTRATION AND STATS
+// ================================================================================
 async function refreshRegistrationStats() {
   if (client.registrationStats.size === 0) return;
 
@@ -6403,6 +6436,10 @@ async function handleLicenseSharingCancel(interaction, userId) {
 }
 
 // Unified dashboard function that handles all instance display contexts
+
+// ================================================================================
+// UNIFIED DASHBOARD
+// ================================================================================
 async function sendUnifiedDashboard(
   channel,
   userId,
