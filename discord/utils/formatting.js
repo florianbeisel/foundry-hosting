@@ -1,12 +1,17 @@
 const { EMOJIS } = require("../config/constants");
 
 /**
- * Sanitize a username for use in filenames
+ * Sanitize a username for use in URLs and filenames
  * @param {string} username
  * @returns {string}
  */
 function sanitizeUsername(username) {
-  return username.replace(/[^a-zA-Z0-9-_]/g, "_").toLowerCase();
+  return username
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "-") // Replace non-alphanumeric chars with hyphens
+    .replace(/-+/g, "-") // Replace multiple hyphens with single hyphen
+    .replace(/^-|-$/g, "") // Remove leading/trailing hyphens
+    .substring(0, 32); // Limit length
 }
 
 /**
