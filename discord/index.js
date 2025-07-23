@@ -20,6 +20,17 @@ const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
 const cron = require("node-cron");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 
+// Import constants
+const {
+  SUPPORTER_ROLES,
+  CHANNEL_NAMES,
+  COLORS,
+  STATUS_EMOJIS,
+  INTERVALS,
+  LIMITS,
+  MESSAGES,
+} = require("./constants");
+
 // ================================================================================
 // DISCORD BOT FOR FOUNDRY VTT MANAGEMENT
 // ================================================================================
@@ -54,11 +65,6 @@ const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 // ================================================================================
 // CONFIGURATION AND CONSTANTS
 // ================================================================================
-const SUPPORTER_ROLES = {
-  "699727231794020353": 15, // $15 supporter
-  "699727011979067484": 10, // $10 supporter
-  "699727432424620033": 5, // $5 supporter
-};
 
 function getUserSupporterAmount(member) {
   if (!member) return 0;
@@ -368,7 +374,7 @@ async function setupLoggingChannel() {
 
     // Check if logging channel already exists
     let existingChannel = guild.channels.cache.find(
-      (c) => c.name === "foundry-bot-logs"
+      (c) => c.name === CHANNEL_NAMES.LOGGING
     );
 
     if (existingChannel) {
@@ -377,7 +383,7 @@ async function setupLoggingChannel() {
     } else {
       // Create new logging channel
       loggingChannel = await guild.channels.create({
-        name: "foundry-bot-logs",
+        name: CHANNEL_NAMES.LOGGING,
         type: ChannelType.GuildText,
         permissionOverwrites: [
           {
@@ -786,15 +792,7 @@ async function clearChannelMessages(channel) {
 
 // Helper function to get status emoji
 function getStatusEmoji(status) {
-  const statusEmojis = {
-    running: "🟢",
-    starting: "🟡",
-    stopping: "🟠",
-    stopped: "🔴",
-    created: "⚪",
-    unknown: "❔",
-  };
-  return statusEmojis[status] || "❔";
+  return STATUS_EMOJIS[status] || STATUS_EMOJIS.unknown;
 }
 
 /**
