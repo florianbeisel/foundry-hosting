@@ -2,10 +2,10 @@
   "name": "foundry-discord-bot",
   "version": "1.0.0",
   "description": "Interactive Discord bot for managing Foundry VTT instances",
-  "main": "index.js",
+  "main": "src/boot/index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
+    "start": "node src/boot/index.js",
+    "dev": "nodemon src/boot/index.js",
     "deploy-commands": "node deploy-commands.js",
     "docker:build": "docker build -t foundry-vtt-discord-bot .",
     "docker:tag": "docker tag foundry-vtt-discord-bot:latest $ECR_REPO_URL:latest",
