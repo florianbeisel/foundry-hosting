@@ -20,17 +20,57 @@ const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
 const cron = require("node-cron");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 
+// ================================================================================
+// DISCORD BOT FOR FOUNDRY VTT MANAGEMENT
+// ================================================================================
+// This file contains the complete Discord bot implementation for managing
+// Foundry VTT instances. The code is organized into the following sections:
+//
+// 1. Configuration and Constants
+// 2. Database Operations
+// 3. Logging and Console Setup
+// 4. UI Components and Embeds
+// 5. Utility Functions
+// 6. Channel Management
+// 7. AWS Lambda Operations
+// 8. Permission Utilities
+// 9. Monitoring and Status
+// 10. Bot Events and Initialization
+// 11. Interaction Handlers
+// 12. Command Handlers
+// 13. Button Interaction Handlers
+// 14. Modal Handlers
+// 15. Select Menu Handlers
+// 16. Registration and Stats
+// 17. Admin Functions
+// 18. Unified Dashboard
+// ================================================================================
+
 // =================
-// IMPORTED MODULES
+// SUPPORTER ROLES
 // =================
 
-// Import configuration
-const { SUPPORTER_ROLES } = require("./config/constants");
 
-// Import utility functions
-const { getUserSupporterAmount, hasRequiredRole, hasAdminRole } = require("./utils/permissions");
-const { sanitizeUsername, getStatusEmoji } = require("./utils/formatting");
-const { createKofiSupportButton } = require("./utils/components");
+// ================================================================================
+// CONFIGURATION AND CONSTANTS
+// ================================================================================
+const SUPPORTER_ROLES = {
+  "699727231794020353": 15, // $15 supporter
+  "699727011979067484": 10, // $10 supporter
+  "699727432424620033": 5, // $5 supporter
+};
+
+function getUserSupporterAmount(member) {
+  if (!member) return 0;
+
+  for (const [roleId, amount] of Object.entries(SUPPORTER_ROLES)) {
+    if (member.roles.cache.has(roleId)) {
+      return amount;
+    }
+  }
+
+  return 0;
+}
 const {
   DynamoDBDocumentClient,
   GetCommand,
@@ -46,6 +86,10 @@ if (botConfigTableName) {
   botConfigDynamo = DynamoDBDocumentClient.from(ddbClient);
 }
 
+
+// ================================================================================
+// DATABASE OPERATIONS
+// ================================================================================
 async function loadRegistrationStatsMappingFromDB() {
   if (!botConfigDynamo) return null;
   try {
@@ -309,6 +353,10 @@ let loggingChannel = null;
 let logQueue = [];
 let isProcessingLogs = false;
 
+
+// ================================================================================
+// LOGGING AND CONSOLE SETUP
+// ================================================================================
 async function setupLoggingChannel() {
   try {
     // Find the first guild (server) the bot is in
@@ -536,6 +584,10 @@ client.userDashboardMessages = new Map(); // userId -> dashboard messageId
 const lastKnownStatus = new Map(); // userId -> { status, updatedAt, url }
 
 // Helper function to build status embed for message updates
+
+// ================================================================================
+// UI COMPONENTS AND EMBEDS
+// ================================================================================
 async function buildStatusEmbed(status) {
   const statusEmoji = {
     running: "🟢",
@@ -643,7 +695,19 @@ fs.readdirSync(commandsPath)
     }
   });
 
+// Helper function to sanitize Discord username for URL use
 
+// ================================================================================
+// UTILITY FUNCTIONS
+// ================================================================================
+function sanitizeUsername(username) {
+  return username
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "-") // Replace non-alphanumeric chars with hyphens
+    .replace(/-+/g, "-") // Replace multiple hyphens with single hyphen
+    .replace(/^-|-$/g, "") // Remove leading/trailing hyphens
+    .substring(0, 32); // Limit length for ALB target group name constraints
+}
 
 // Helper function to clear all messages from a channel
 async function clearChannelMessages(channel) {
@@ -720,7 +784,18 @@ async function clearChannelMessages(channel) {
   }
 }
 
-
+// Helper function to get status emoji
+function getStatusEmoji(status) {
+  const statusEmojis = {
+    running: "🟢",
+    starting: "🟡",
+    stopping: "🟠",
+    stopped: "🔴",
+    created: "⚪",
+    unknown: "❔",
+  };
+  return statusEmojis[status] || "❔";
+}
 
 /**
  * Create Ko-fi donation button row for supporting the server
@@ -751,6 +826,10 @@ function createKofiSupportButton(
 }
 
 // Helper function to find existing command channel for a user
+
+// ================================================================================
+// CHANNEL MANAGEMENT
+// ================================================================================
 async function findExistingCommandChannel(guild, userId, username) {
   await guild.channels.fetch(); // Ensure we have all channels in cache
 
@@ -788,6 +867,10 @@ async function findExistingCommandChannel(guild, userId, username) {
 }
 
 // Helper function to invoke Lambda
+
+// ================================================================================
+// AWS LAMBDA OPERATIONS
+// ================================================================================
 async function invokeLambda(payload) {
   console.log(
     "Invoking Lambda with payload:",
@@ -862,6 +945,10 @@ async function getUserCostsWithSupporter(userId, guild) {
 }
 
 // Helper functions for permissions and channels
+
+// ================================================================================
+// PERMISSION UTILITIES
+// ================================================================================
 function hasRequiredRole(member) {
   // Handle null member (DMs or missing member info)
   if (!member || !member.roles) return false;
@@ -1059,6 +1146,10 @@ async function deleteUserCommandChannel(guild, userId) {
   }
 }
 
+
+// ================================================================================
+// MONITORING AND STATUS
+// ================================================================================
 function startStatusMonitoring(userId, channelId) {
   // Clear any existing monitor
   stopStatusMonitoring(userId);
@@ -1286,6 +1377,10 @@ async function syncAllInstances() {
   }
 }
 
+
+// ================================================================================
+// BOT EVENTS AND INITIALIZATION
+// ================================================================================
 // Bot ready event
 client.once("ready", async () => {
   console.log(`✅ Foundry VTT Bot is ready! Logged in as ${client.user.tag}`);
@@ -1428,6 +1523,10 @@ process.on("unhandledRejection", (error) => {
   console.error("Unhandled promise rejection:", error);
 });
 
+
+// ================================================================================
+// INTERACTION HANDLERS
+// ================================================================================
 // Interaction handling
 client.on("interactionCreate", async (interaction) => {
   if (interaction.isChatInputCommand()) {
@@ -1446,6 +1545,10 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
+
+// ================================================================================
+// COMMAND HANDLERS
+// ================================================================================
 async function handleSlashCommand(interaction) {
   // Skip role check for DMs (no guild member context)
   if (interaction.guild && !hasRequiredRole(interaction.member)) {
@@ -1512,6 +1615,10 @@ async function handleSlashCommand(interaction) {
   }
 }
 
+
+// ================================================================================
+// BUTTON INTERACTION HANDLERS
+// ================================================================================
 async function handleButtonInteraction(interaction) {
   const parts = interaction.customId.split("_");
   const [action, subAction] = parts;
@@ -2455,6 +2562,10 @@ async function handleAdminButtonInteraction(interaction) {
   }
 }
 
+
+// ================================================================================
+// MODAL HANDLERS
+// ================================================================================
 async function handleModalSubmit(interaction) {
   if (interaction.customId.startsWith("foundry_credentials_")) {
     await handleCredentialsModal(interaction);
@@ -3739,6 +3850,10 @@ async function handleDestroyCancelButton(interaction, userId) {
   });
 }
 
+
+// ================================================================================
+// SELECT MENU HANDLERS
+// ================================================================================
 async function handleSelectMenuInteraction(interaction) {
   const parts = interaction.customId.split("_");
 
@@ -5392,6 +5507,10 @@ cron.schedule("*/5 * * * *", async () => {
 });
 
 // Function to refresh all stats embeds in registration channels
+
+// ================================================================================
+// REGISTRATION AND STATS
+// ================================================================================
 async function refreshRegistrationStats() {
   if (client.registrationStats.size === 0) return;
 
@@ -6374,6 +6493,10 @@ async function handleLicenseSharingCancel(interaction, userId) {
 }
 
 // Unified dashboard function that handles all instance display contexts
+
+// ================================================================================
+// UNIFIED DASHBOARD
+// ================================================================================
 async function sendUnifiedDashboard(
   channel,
   userId,
