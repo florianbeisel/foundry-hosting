@@ -5,9 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "start:refactored": "node src/index.js",
     "dev": "nodemon index.js",
-    "dev:refactored": "nodemon src/index.js",
     "deploy-commands": "node deploy-commands.js",
     "docker:build": "docker build -t foundry-vtt-discord-bot .",
     "docker:tag": "docker tag foundry-vtt-discord-bot:latest $ECR_REPO_URL:latest",
