@@ -1,14 +1,37 @@
-# Reorganize Discord Bot Code for Better Maintainability
+# Refactor Discord Bot: Extract Constants and Instance Management
 
 ## Summary
 
-This PR reorganizes the Discord bot's `index.js` file by adding clear section headers and documentation, making the 6944-line file more navigable and maintainable without changing any functionality.
+This PR begins the modularization of the Discord bot by:
+1. Extracting all constants into a separate `constants.js` file
+2. Moving instance management commands (Start/Stop) into `instanceManagement.js`
+3. Adding clear section headers throughout `index.js` for better organization
 
 ## Changes
 
-- Added comprehensive section headers throughout `index.js`
-- Added a table of contents at the top of the file
-- Grouped related functions under appropriate sections
+### New Files Created
+- **`constants.js`** - Centralized configuration for:
+  - Supporter roles and amounts
+  - Channel names and prefixes
+  - Embed colors
+  - Status emojis
+  - Monitoring intervals
+  - Discord limits
+  - Message templates
+
+- **`instanceManagement.js`** - Instance lifecycle commands:
+  - `handleStartInstance` - Start a Foundry instance
+  - `handleStopInstance` - Stop a Foundry instance with session checks
+  - `performStopInstance` - Execute the stop operation
+  - `handleStopCancelSession` - Stop and cancel active session
+  - `handleStopRestart` - Stop and restart instance
+  - `handleStopCancel` - Cancel stop operation
+
+### Changes to index.js
+- Added comprehensive section headers throughout the file
+- Imported constants from `constants.js`
+- Imported instance management functions from `instanceManagement.js`
+- Replaced hardcoded values with constants
 - No functional changes - 100% backward compatible
 
 ## Section Organization

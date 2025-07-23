@@ -31,6 +31,16 @@ const {
   MESSAGES,
 } = require("./constants");
 
+// Import instance management functions
+const {
+  handleStartInstance,
+  handleStopInstance,
+  performStopInstance,
+  handleStopCancelSession,
+  handleStopRestart,
+  handleStopCancel,
+} = require("./instanceManagement");
+
 // ================================================================================
 // DISCORD BOT FOR FOUNDRY VTT MANAGEMENT
 // ================================================================================
@@ -1879,7 +1889,10 @@ async function handleButtonInteraction(interaction) {
 
   if (confirmAction === "stop_cancel_session") {
     try {
-      await handleStopCancelSession(interaction, userId);
+      await handleStopCancelSession(interaction, userId, {
+        invokeLambda,
+        stopStatusMonitoring,
+      });
       return;
     } catch (error) {
       console.error("Stop cancel session error:", error);
@@ -1892,7 +1905,12 @@ async function handleButtonInteraction(interaction) {
 
   if (confirmAction === "stop_restart") {
     try {
-      await handleStopRestart(interaction, userId);
+      await handleStopRestart(interaction, userId, {
+        invokeLambda,
+        stopStatusMonitoring,
+        startStatusMonitoring,
+        client,
+      });
       return;
     } catch (error) {
       console.error("Stop restart error:", error);
@@ -1905,7 +1923,7 @@ async function handleButtonInteraction(interaction) {
 
   if (confirmAction === "stop_cancel") {
     try {
-      await handleStopCancel(interaction, userId);
+      await handleStopCancel(interaction, userId, {});
       return;
     } catch (error) {
       console.error("Stop cancel error:", error);
@@ -1933,10 +1951,24 @@ async function handleButtonInteraction(interaction) {
   try {
     switch (subAction) {
       case "start":
-        await handleStartButton(interaction, userId);
+        await handleStartInstance(interaction, userId, {
+          invokeLambda,
+          client,
+          findExistingCommandChannel,
+          createUserCommandChannel,
+          safeChannelSend,
+          startStatusMonitoring,
+        });
         break;
       case "stop":
-        await handleStopButton(interaction, userId);
+        await handleStopInstance(interaction, userId, {
+          invokeLambda,
+          performStopInstance: (interaction, userId) => 
+            performStopInstance(interaction, userId, {
+              invokeLambda,
+              stopStatusMonitoring,
+            }),
+        });
         break;
       case "status":
         await handleStatusButton(interaction, userId);
@@ -3046,93 +3078,6 @@ async function handleScheduleModal(interaction) {
   }
 }
 
-async function handleStartButton(interaction, userId) {
-  const result = await invokeLambda({
-    action: "start",
-    userId: userId,
-  });
-
-  const embed = new EmbedBuilder()
-    .setColor("#ffff00")
-    .setTitle("🚀 Starting Instance")
-    .setDescription("Starting up, takes 2-3 minutes.")
-    .addFields([
-      { name: "Status", value: "🟡 Starting", inline: true },
-      { name: "Estimated Time", value: "2-3 minutes", inline: true },
-      {
-        name: "Your URL",
-        value: result.url || "Will be available shortly",
-        inline: false,
-      },
-    ])
-    .setTimestamp();
-
-  // Get or create user command channel (don't send duplicate to interaction reply)
-  let channelId = client.userChannels.get(userId);
-  let channel;
-
-  if (!channelId) {
-    // First try to find existing channel
-    const user = await client.users.fetch(userId);
-    channel = await findExistingCommandChannel(
-      interaction.guild,
-      userId,
-      user.username
-    );
-
-    if (!channel) {
-      // No existing channel found, create new one
-      channel = await createUserCommandChannel(
-        interaction.guild,
-        userId,
-        user.username
-      );
-    }
-    channelId = channel.id;
-  } else {
-    channel = client.channels.cache.get(channelId);
-  }
-
-  if (channel) {
-    // Send starting message to command channel only (avoid duplication)
-    await interaction.editReply({
-      content: `🚀 Starting... Check ${channel}`,
-    });
-
-    try {
-      await safeChannelSend(
-        channel,
-        { embeds: [embed] },
-        // Fallback: create new channel if current one is inaccessible
-        async () => {
-          const user = await client.users.fetch(userId);
-          return await createUserCommandChannel(
-            interaction.guild,
-            userId,
-            user.username
-          );
-        }
-      );
-
-      // Start status monitoring immediately to catch when instance becomes ready
-      startStatusMonitoring(userId, channelId);
-    } catch (error) {
-      console.error("Failed to send message to any channel:", error);
-      await interaction.editReply({
-        content:
-          "❌ Unable to access or create your command channel. Please contact an admin.",
-      });
-    }
-  } else {
-    console.error(
-      `Channel not found for user ${userId}, channelId: ${channelId}`
-    );
-    await interaction.editReply({
-      content:
-        "❌ Command channel not found. Please try creating a new instance.",
-    });
-  }
-}
 
 async function handleStopButton(interaction, userId) {
   // First check if this instance is running a scheduled session
